@@ -1,0 +1,12 @@
+# DiffRouter-py: Differentiable Global Router for FPGA
+# Python 3.8+
+
+torch>=2.0.0
+numpy>=1.20.0
+matplotlib>=3.5.0
+Pillow>=9.0.0
+pytest>=8.0.0
+
+# RapidWright: FPGA design/device API (--from-device, ExtractRRG, load_design)
+# Requires Java 8+
+rapidwright>=2024.1.0

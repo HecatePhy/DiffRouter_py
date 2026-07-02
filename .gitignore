@@ -1,0 +1,22 @@
+fpga24_routing_contest/
+*.log
+data/
+results/
+docs/
+
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.env
+.venv/
+venv/
+
+cpp/build/
+
+# Large generated / local artifacts
+*.pt
+*.phys
+*.dcp
+*.device

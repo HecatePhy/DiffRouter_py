@@ -1,0 +1,195 @@
+"""Augmented Lagrangian optimizer for GlobalRouter."""
+
+import os
+from typing import Optional
+
+import torch
+
+from src.router.checkpoint import save_checkpoint
+from src.router.meng_lambda import update_multipliers_meng
+
+
+def optimize_augmented_lagrangian(
+    router,
+    x: Optional[torch.Tensor] = None,
+    num_outer: int = 200,
+    num_inner: int = 5,
+    max_iterations: int = 1000,
+    viz_interval: int = 50,
+    viz_dir: Optional[str] = None,
+    checkpoint_dir: Optional[str] = None,
+    save_every: int = 0,
+    resume_path: Optional[str] = None,
+    lr_x: float = 0.01,
+    lr_lam: float = 0.1,
+    rho: float = 1.0,
+    rho_max: float = 100.0,
+    rho_mult: float = 2.0,
+    w_wl: float = 1.0,
+    w_conn: float = 1.0,
+    w_flow: float = 1.0,
+    connectivity: str = "effective_resistance",
+    connectivity_solver: str = "solve",
+    conn_net_batch: int = 0,
+    flow_net_batch: int = 0,
+    verbose: bool = True,
+    log_setup: bool = True,
+) -> torch.Tensor:
+    router.connectivity_solver = connectivity_solver
+    router.conn_net_batch = conn_net_batch
+    router.flow_net_batch = flow_net_batch
+
+    if log_setup:
+        print("  [4a] Initializing x variables...")
+    overflow_ref = None
+    if resume_path and os.path.isfile(resume_path):
+        from src.router.checkpoint import load_checkpoint
+        ckpt = load_checkpoint(resume_path, router.device)
+        x = ckpt["x"]
+        lam = ckpt["lam"]
+        rho = ckpt.get("rho", rho)
+        total_iter = ckpt.get("total_iter", 0)
+        start_outer = ckpt.get("outer", 0)
+        if "overflow_ref" in ckpt:
+            overflow_ref = ckpt["overflow_ref"].to(router.device)
+        if log_setup:
+            print(f"  [4a] Resumed from {resume_path} at iter {total_iter}")
+    else:
+        if x is None:
+            x = router.init_variables()
+        else:
+            x = x.detach().clone().requires_grad_(True)
+        lam = torch.zeros(len(router.rrg.phys_list), device=router.device, dtype=x.dtype)
+        total_iter = 0
+        start_outer = 0
+
+    if not x.requires_grad:
+        x = x.detach().clone().requires_grad_(True)
+
+    if log_setup:
+        print(f"  [4b] Created λ multipliers: {len(router.rrg.phys_list)} physical edges")
+
+    optimizer = torch.optim.Adam([x], lr=lr_x)
+    if log_setup:
+        print(f"  [4c] Adam optimizer ready (lr_x={lr_x})")
+
+    gif_frames = []
+    if viz_dir:
+        os.makedirs(viz_dir, exist_ok=True)
+        if log_setup:
+            print(f"  [4d] Viz dir ready: {viz_dir}")
+
+    if log_setup:
+        print("  [4e] Starting outer loop (Augmented Lagrangian)...")
+
+    for outer in range(start_outer, num_outer):
+        for _inner in range(num_inner):
+            optimizer.zero_grad()
+            L_A = router.augmented_lagrangian(
+                x,
+                lam,
+                rho,
+                w_wl=w_wl,
+                w_conn=w_conn,
+                w_flow=w_flow,
+                connectivity=connectivity,
+                connectivity_solver=connectivity_solver,
+                conn_net_batch=conn_net_batch,
+                flow_net_batch=flow_net_batch,
+            )
+            L_A.backward()
+            optimizer.step()
+            with torch.no_grad():
+                x.clamp_(0.0, 1.0)
+
+            total_iter += 1
+
+            if viz_dir and total_iter % viz_interval == 0:
+                if verbose:
+                    print(f"      [viz] Capturing frame at iter {total_iter}")
+                from PIL import Image
+                from src.Visualizer import render_congestion_frame
+                cong_grid = router.get_congestion_map(x)
+                frame_arr = render_congestion_frame(
+                    cong_grid,
+                    title=f"Congestion (flow/capacity) @ iter {total_iter}",
+                )
+                gif_frames.append(Image.fromarray(frame_arr))
+
+            if checkpoint_dir and save_every > 0 and total_iter % save_every == 0:
+                ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_iter{total_iter:06d}.pt")
+                extra = {"overflow_ref": overflow_ref.detach().cpu()} if overflow_ref is not None else None
+                save_checkpoint(ckpt_path, x, lam, rho, total_iter, outer + 1, extra=extra)
+
+            if total_iter >= max_iterations:
+                if verbose:
+                    print(f"      [stop] Reached max_iterations={max_iterations}")
+                break
+
+        if total_iter >= max_iterations:
+            break
+
+        with torch.no_grad():
+            _, overflows = router._get_usage_and_overflows(x)
+            if overflow_ref is None:
+                overflow_ref = torch.clamp(overflows.clone(), min=1e-8)
+            lam = update_multipliers_meng(lam, overflows, overflow_ref, lr_lam)
+
+        if overflows.max().item() > 0.1 and rho < rho_max:
+            rho = min(rho * rho_mult, rho_max)
+            if verbose:
+                print(f"      [rho] Increased to {rho:.2f}")
+
+        if verbose and (outer + 1) % 20 == 0:
+            wl = router.wirelength_loss(x).item()
+            conn = router.connectivity_loss_effective_resistance(
+                x, solver=connectivity_solver, net_batch=conn_net_batch
+            ).item()
+            max_of = overflows.max().item()
+            lam_min, lam_max = lam.min().item(), lam.max().item()
+            lam_mean = lam.float().mean().item()
+            lam_norm = lam.norm().item()
+            if getattr(router, "edge_mode", "directed") == "undirected":
+                print(
+                    f"  [metrics] Outer {outer+1}/{num_outer} (iter {total_iter}): "
+                    f"wl={wl:.2f} conn={conn:.2f} max_overflow={max_of:.4f} | "
+                    f"λ: min={lam_min:.4f} max={lam_max:.4f} mean={lam_mean:.4f} ‖λ‖={lam_norm:.2f}"
+                )
+            else:
+                flow = router.flow_conservation_loss(
+                    x, net_batch=flow_net_batch
+                ).item()
+                print(
+                    f"  [metrics] Outer {outer+1}/{num_outer} (iter {total_iter}): "
+                    f"wl={wl:.2f} conn={conn:.2f} flow={flow:.2f} max_overflow={max_of:.4f} | "
+                    f"λ: min={lam_min:.4f} max={lam_max:.4f} mean={lam_mean:.4f} ‖λ‖={lam_norm:.2f}"
+                )
+
+    if log_setup:
+        print("  [4f] Optimization loop finished")
+
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        final_ckpt = os.path.join(checkpoint_dir, "checkpoint_final.pt")
+        extra = {"overflow_ref": overflow_ref.detach().cpu()} if overflow_ref is not None else None
+        save_checkpoint(final_ckpt, x, lam, rho, total_iter, outer + 1, extra=extra)
+        global_x_path = os.path.join(checkpoint_dir, "global_x.pt")
+        torch.save(x.detach().cpu(), global_x_path)
+        if log_setup:
+            print(f"  [4f] Saved checkpoint: {final_ckpt}")
+
+    if viz_dir and gif_frames:
+        if log_setup:
+            print(f"  [4g] Writing congestion evolution GIF ({len(gif_frames)} frames)...")
+        gif_path = os.path.join(viz_dir, "congestion_evolution.gif")
+        gif_frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=gif_frames[1:],
+            duration=200,
+            loop=0,
+        )
+        if log_setup:
+            print(f"  [4g] Saved: {gif_path}")
+
+    return x.detach()
