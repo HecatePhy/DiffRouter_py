@@ -59,12 +59,58 @@ def default_net_index_path(
     min_fanout: int,
     expansion_ratio: float,
     route_filter: str = "stubs",
+    edge_scope: str = "corridor",
+    corridor_width: int = 2,
+    max_edges_per_net: Optional[int] = 50000,
 ) -> str:
     rrg_stem = os.path.splitext(os.path.basename(rrg_path))[0]
     exp_tag = int(round(expansion_ratio * 100))
     filter_tag = route_filter if route_filter else "all"
-    name = f"{rrg_stem}_{edge_mode}_{filter_tag}_mf{min_fanout}_exp{exp_tag}.pt"
-    return os.path.join(data_prefix, testcase, "net_index", name)
+    name = f"{rrg_stem}_{edge_mode}_{filter_tag}_mf{min_fanout}_exp{exp_tag}"
+    if edge_scope == "corridor":
+        name += f"_corr{corridor_width}"
+        if max_edges_per_net is not None:
+            name += f"_cap{max_edges_per_net}"
+    else:
+        name += "_bbox"
+    return os.path.join(data_prefix, testcase, "net_index", f"{name}.pt")
+
+
+def resolve_net_edges(
+    rrg: Any,
+    edge_mode: str,
+    edge_scope: str,
+    src_idx: int,
+    sink_idxs: List[int],
+    bbox: Tuple[int, int, int, int],
+    corridor_width: int = 2,
+    max_edges_per_net: Optional[int] = 50000,
+) -> Optional[List[int]]:
+    """Return edge variable indices for a net, or None if over cap / empty."""
+    if edge_scope == "corridor":
+        w = corridor_width
+        edge_indices: Optional[List[int]] = None
+        while w >= 0:
+            if edge_mode == "undirected":
+                cand = rrg.get_phys_edges_in_corridor(src_idx, sink_idxs, half_width=w)
+            else:
+                cand = rrg.get_edges_in_corridor(src_idx, sink_idxs, half_width=w)
+            if max_edges_per_net is None or len(cand) <= max_edges_per_net:
+                edge_indices = cand
+                break
+            w -= 1
+    else:
+        min_col, max_col, min_row, max_row = bbox
+        if edge_mode == "undirected":
+            edge_indices = rrg.get_phys_edges_in_bbox(min_col, max_col, min_row, max_row)
+        else:
+            edge_indices = rrg.get_edges_in_bbox(min_col, max_col, min_row, max_row)
+        if max_edges_per_net is not None and len(edge_indices) > max_edges_per_net:
+            return None
+
+    if not edge_indices:
+        return None
+    return edge_indices
 
 
 def _net_name(net: Any) -> str:
@@ -83,6 +129,9 @@ class NetIndex:
     min_fanout: int = 0
     expansion_ratio: float = 0.1
     edge_mode: str = "directed"
+    edge_scope: str = "corridor"
+    corridor_width: int = 2
+    max_edges_per_net: Optional[int] = 50000
     max_nets: Optional[int] = None
     net_names: List[str] = field(default_factory=list)
     net_src_tile: torch.Tensor = field(default_factory=lambda: torch.zeros(0, dtype=torch.long))
@@ -251,6 +300,9 @@ class NetIndex:
         max_nets: Optional[int] = None,
         rrg_fingerprint: str = "",
         design_fingerprint: str = "",
+        edge_scope: str = "corridor",
+        corridor_width: int = 2,
+        max_edges_per_net: Optional[int] = 50000,
         verbose: bool = True,
     ) -> "NetIndex":
         """Build NetIndex from extract_net_index JSON (Potter-like stub nets)."""
@@ -264,32 +316,37 @@ class NetIndex:
         net_fanout: List[int] = []
         net_bbox: List[Tuple[int, int, int, int]] = []
         net_edge_indices: List[List[int]] = []
+        skipped_cap = 0
 
         for entry in stub_json.get("nets", []):
             if max_nets is not None and len(net_names) >= max_nets:
                 break
 
-            min_col, max_col, min_row, max_row = [int(x) for x in entry["bbox"]]
-            if edge_mode == "undirected":
-                edge_indices = rrg.get_phys_edges_in_bbox(
-                    min_col, max_col, min_row, max_row
-                )
-            else:
-                edge_indices = rrg.get_edges_in_bbox(
-                    min_col, max_col, min_row, max_row
-                )
-            if not edge_indices:
-                continue
-
+            bbox = tuple(int(x) for x in entry["bbox"])
+            src_idx = int(entry["src_int_idx"])
             sink_idxs = [int(x) for x in entry.get("sink_int_idxs", [])]
             if not sink_idxs:
                 continue
 
+            edge_indices = resolve_net_edges(
+                rrg,
+                edge_mode,
+                edge_scope,
+                src_idx,
+                sink_idxs,
+                bbox,
+                corridor_width=corridor_width,
+                max_edges_per_net=max_edges_per_net,
+            )
+            if edge_indices is None:
+                skipped_cap += 1
+                continue
+
             net_names.append(str(entry["name"]))
-            net_src.append(int(entry["src_int_idx"]))
+            net_src.append(src_idx)
             net_sinks.append(sink_idxs)
             net_fanout.append(int(entry.get("fanout", len(sink_idxs))))
-            net_bbox.append((min_col, max_col, min_row, max_row))
+            net_bbox.append(bbox)
             net_edge_indices.append(edge_indices)
 
         var_offset = [0]
@@ -299,7 +356,13 @@ class NetIndex:
         if verbose:
             scanned = int(stub_json.get("phys_nets_scanned", 0))
             kept = len(net_names)
-            print(f"    Stub net list: scanned {scanned} phys nets, kept {kept} nets")
+            extra = ""
+            if skipped_cap:
+                extra = f", skipped {skipped_cap} (edge cap)"
+            print(
+                f"    Stub net list: scanned {scanned} phys nets, kept {kept} nets"
+                f" (edge_scope={edge_scope}{extra})"
+            )
 
         return cls(
             format_version=2,
@@ -309,6 +372,9 @@ class NetIndex:
             min_fanout=min_fanout,
             expansion_ratio=expansion_ratio,
             edge_mode=edge_mode,
+            edge_scope=edge_scope,
+            corridor_width=corridor_width,
+            max_edges_per_net=max_edges_per_net,
             max_nets=max_nets,
             net_names=net_names,
             net_src_tile=torch.tensor(net_src, dtype=torch.long),
@@ -332,6 +398,9 @@ class NetIndex:
                 "min_fanout": self.min_fanout,
                 "expansion_ratio": self.expansion_ratio,
                 "edge_mode": self.edge_mode,
+                "edge_scope": self.edge_scope,
+                "corridor_width": self.corridor_width,
+                "max_edges_per_net": self.max_edges_per_net,
                 "max_nets": self.max_nets,
                 "net_names": self.net_names,
                 "net_src_tile": self.net_src_tile,
@@ -357,6 +426,9 @@ class NetIndex:
             min_fanout=int(data["min_fanout"]),
             expansion_ratio=float(data["expansion_ratio"]),
             edge_mode=str(data["edge_mode"]),
+            edge_scope=str(data.get("edge_scope", "bbox")),
+            corridor_width=int(data.get("corridor_width", 2)),
+            max_edges_per_net=data.get("max_edges_per_net"),
             max_nets=data.get("max_nets"),
             net_names=list(data["net_names"]),
             net_src_tile=data["net_src_tile"].long(),
@@ -395,7 +467,8 @@ class NetIndex:
         router.net_sink_tiles = [t.tolist() for t in self.net_sink_tiles]
         router.net_fanout = self.net_fanout.tolist()
         router.net_bbox = [tuple(row.tolist()) for row in self.net_bbox]
-        router.net_edge_indices = [t.tolist() for t in self.net_edge_indices]
+        # Keep as CPU long tensors (list-of-int conversion costs ~30B/var).
+        router.net_edge_indices = list(self.net_edge_indices)
         router.num_nets = self.num_nets
         router._var_offset = self.var_offset.tolist()
         router.num_vars = self.num_vars
@@ -463,6 +536,9 @@ def build_and_save(
     edge_mode: str = "directed",
     max_nets: Optional[int] = None,
     route_filter: str = "stubs",
+    edge_scope: str = "corridor",
+    corridor_width: int = 2,
+    max_edges_per_net: Optional[int] = 50000,
     use_java: bool = False,
     design: Any = None,
     device=None,
@@ -549,6 +625,9 @@ def build_and_save(
                 max_nets=max_nets,
                 rrg_fingerprint=rrg_fingerprint,
                 design_fingerprint=design_fingerprint,
+                edge_scope=edge_scope,
+                corridor_width=corridor_width,
+                max_edges_per_net=max_edges_per_net,
                 verbose=verbose,
             )
         finally:

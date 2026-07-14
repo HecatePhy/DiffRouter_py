@@ -1,6 +1,7 @@
 """Extract discrete INT-tile paths from continuous global routing solution."""
 
 import heapq
+import os
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -29,12 +30,23 @@ class RouteExtractor:
         router,
         x: torch.Tensor,
         congestion_map: Optional[np.ndarray] = None,
+        workers: int = 0,
     ) -> Dict[int, List[int]]:
-        x_cpu = x.detach().cpu()
-        paths: Dict[int, List[int]] = {}
-        for net_idx in range(router.num_nets):
-            paths[net_idx] = self.extract_one(router, x_cpu, net_idx, congestion_map)
-        return paths
+        """Extract discrete paths for all nets.
+
+        workers=1 forces serial; workers>1 or 0 (auto) runs a fork-based process
+        pool -- nets are independent, so this scales near-linearly across cores.
+        """
+        if workers == 1:
+            x_cpu = x.detach().cpu()
+            return {
+                i: self.extract_one(router, x_cpu, i, congestion_map)
+                for i in range(router.num_nets)
+            }
+        return extract_paths_parallel(
+            router, x, threshold=self.threshold, workers=workers,
+            congestion_map=congestion_map,
+        )
 
     def extract_one(
         self,
@@ -47,6 +59,8 @@ class RouteExtractor:
         sinks = router.net_sink_tiles[net_idx]
         start, end = router._var_offset[net_idx], router._var_offset[net_idx + 1]
         edge_list = router.net_edge_indices[net_idx]
+        if torch.is_tensor(edge_list):
+            edge_list = edge_list.tolist()
         x_slice = x[start:end]
 
         adj: Dict[int, List[Tuple[int, float, int]]] = {}
@@ -58,23 +72,35 @@ class RouteExtractor:
             adj.setdefault(u, []).append((v, w, edge_idx))
             adj.setdefault(v, []).append((u, w, edge_idx))
 
-        terminals = {src} | set(sinks)
-        path_tiles: Set[int] = {src}
+        # Routing tree = union of src->sink shortest paths. Return its tiles in a
+        # stable order (src first, then each path), deduplicated. This IS the tree;
+        # no need for the old greedy walk that ran a Dijkstra per remaining tile
+        # until every above-threshold tile was ordered -- that was O(tiles^2 *
+        # Dijkstra) per net and hung on large post-optimization nets.
+        ordered: List[int] = []
+        seen: Set[int] = set()
+
+        def _add(tiles: List[int]) -> None:
+            for t in tiles:
+                if t not in seen:
+                    seen.add(t)
+                    ordered.append(t)
+
+        _add([src])
         for sink in sinks:
             segment = self._shortest_path(
                 router, adj, src, sink, congestion_map, net_idx
             )
-            path_tiles.update(segment)
+            _add(segment)
 
-        if len(path_tiles) < len(terminals):
-            for sink in sinks:
-                if sink not in path_tiles:
-                    fallback = self._dijkstra_fallback(
-                        router, net_idx, src, sink, x_slice, edge_list, congestion_map
-                    )
-                    path_tiles.update(fallback)
+        missing = [s for s in sinks if s not in seen]
+        for sink in missing:
+            fallback = self._dijkstra_fallback(
+                router, net_idx, src, sink, x_slice, edge_list, congestion_map
+            )
+            _add(fallback)
 
-        return self._build_tile_sequence(router, adj, src, path_tiles, sinks)
+        return ordered
 
     def _edge_cost(
         self,
@@ -153,6 +179,8 @@ class RouteExtractor:
         congestion_map: Optional[np.ndarray],
     ) -> List[int]:
         edge_list = router.net_edge_indices[net_idx]
+        if torch.is_tensor(edge_list):
+            edge_list = edge_list.tolist()
         adj: Dict[int, List[Tuple[int, float]]] = {}
         for edge_idx in edge_list:
             u, v = self._edge_endpoints(router, edge_idx)
@@ -245,3 +273,57 @@ class RouteExtractor:
             cols = [router.rrg.tiles[t][1] for t in tiles]
             bboxes[net_idx] = (min(cols), max(cols), min(rows), max(rows))
         return bboxes
+
+
+# --- Parallel extraction (nets are independent) --------------------------------
+# Workers share the read-only router/x/extractor via copy-on-write fork, set as
+# module globals before the pool is created.
+_MP_ROUTER = None
+_MP_X = None
+_MP_EX = None
+_MP_CONG = None
+
+
+def _mp_extract_range(rng: Tuple[int, int]) -> Dict[int, List[int]]:
+    lo, hi = rng
+    return {
+        i: _MP_EX.extract_one(_MP_ROUTER, _MP_X, i, _MP_CONG)
+        for i in range(lo, hi)
+    }
+
+
+def extract_paths_parallel(
+    router,
+    x: torch.Tensor,
+    threshold: float = 0.01,
+    workers: int = 0,
+    congestion_map: Optional[np.ndarray] = None,
+) -> Dict[int, List[int]]:
+    """Extract all nets across a fork-based process pool. workers<=0 -> auto."""
+    import multiprocessing as mp
+
+    global _MP_ROUTER, _MP_X, _MP_EX, _MP_CONG
+    if workers <= 0:
+        workers = min(64, os.cpu_count() or 1)
+    ex = RouteExtractor(threshold=threshold)
+    x_cpu = x.detach().cpu()
+    N = router.num_nets
+    if workers == 1 or N == 0:
+        return {i: ex.extract_one(router, x_cpu, i, congestion_map) for i in range(N)}
+
+    _MP_ROUTER, _MP_X, _MP_EX, _MP_CONG = router, x_cpu, ex, congestion_map
+    nchunks = workers * 4
+    step = (N + nchunks - 1) // nchunks
+    ranges = [(i, min(i + step, N)) for i in range(0, N, step)]
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    paths: Dict[int, List[int]] = {}
+    try:
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=workers) as pool:
+            for part in pool.imap_unordered(_mp_extract_range, ranges):
+                paths.update(part)
+    finally:
+        torch.set_num_threads(prev_threads)
+        _MP_ROUTER = _MP_X = _MP_EX = _MP_CONG = None
+    return paths

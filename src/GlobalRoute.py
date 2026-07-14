@@ -65,9 +65,17 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", "-q", action="store_true", help="Run optimization only with logs")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint .pt")
     parser.add_argument("--save-every", type=int, default=0, help="Save checkpoint every N iters")
-    parser.add_argument("--connectivity-solver", choices=["solve", "cg"], default="solve")
+    parser.add_argument("--connectivity-solver", choices=["solve", "cg"], default="cg")
     parser.add_argument("--conn-net-batch", type=int, default=0)
+    parser.add_argument("--conn-col-chunk", type=int, default=32)
+    parser.add_argument("--conn-cg-max-iter", type=int, default=100)
+    parser.add_argument("--conn-edge-chunk", type=int, default=0,
+                        help="Bound connectivity matvec temporary to [edge_chunk, col_chunk] "
+                             "rows; 0=off. Use ~8000000 for large designs to avoid OOM.")
     parser.add_argument("--flow-net-batch", type=int, default=0)
+    parser.add_argument("--edge-scope", choices=["bbox", "corridor"], default="corridor")
+    parser.add_argument("--corridor-width", type=int, default=2)
+    parser.add_argument("--max-edges-per-net", type=int, default=50000)
     parser.add_argument("--lr-x", type=float, default=0.01)
     parser.add_argument("--lr-lam", type=float, default=0.1)
     parser.add_argument("--w-wl", type=float, default=1.0)
@@ -111,11 +119,17 @@ if __name__ == "__main__":
         from src.router.net_index import default_net_index_path, require_net_index_path
 
         net_index_path = args.net_index or default_net_index_path(
-            data_prefix, testcase, args.rrg, args.edge_mode, 0, 0.1, route_filter="stubs"
+            data_prefix, testcase, args.rrg, args.edge_mode, 0, 0.1,
+            route_filter="stubs",
+            edge_scope=args.edge_scope,
+            corridor_width=args.corridor_width,
+            max_edges_per_net=args.max_edges_per_net,
         )
+        cap = f" --max-edges-per-net {args.max_edges_per_net}" if args.max_edges_per_net else ""
         prebuild_hint = (
             f"python scripts/PrebuildNetIndex.py --testcase {testcase} "
-            f"--rrg {args.rrg} --edge-mode {args.edge_mode}"
+            f"--rrg {args.rrg} --edge-mode {args.edge_mode} "
+            f"--edge-scope {args.edge_scope} --corridor-width {args.corridor_width}{cap}"
         )
 
         if args.bbox_only and args.bbox_fast:
@@ -215,6 +229,9 @@ if __name__ == "__main__":
                     edge_mode=args.edge_mode,
                     verbose=not quiet,
                 )
+        router.conn_col_chunk = args.conn_col_chunk
+        router.conn_cg_max_iter = args.conn_cg_max_iter
+        router.conn_edge_chunk = args.conn_edge_chunk
         if not quiet:
             router.print_info()
             router.print_bbox_size_distribution()

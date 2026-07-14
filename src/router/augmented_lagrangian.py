@@ -28,8 +28,10 @@ def optimize_augmented_lagrangian(
     w_wl: float = 1.0,
     w_conn: float = 1.0,
     w_flow: float = 1.0,
+    w_disc: float = 0.0,
+    disc_ramp_outer: int = 0,
     connectivity: str = "effective_resistance",
-    connectivity_solver: str = "solve",
+    connectivity_solver: str = "cg",
     conn_net_batch: int = 0,
     flow_net_batch: int = 0,
     verbose: bool = True,
@@ -83,6 +85,12 @@ def optimize_augmented_lagrangian(
         print("  [4e] Starting outer loop (Augmented Lagrangian)...")
 
     for outer in range(start_outer, num_outer):
+        # Anneal discretization weight from 0 to w_disc over disc_ramp_outer outers
+        # (establish connectivity first, then sharpen to discrete paths).
+        if w_disc != 0.0 and disc_ramp_outer > 0:
+            w_disc_eff = w_disc * min(1.0, outer / float(disc_ramp_outer))
+        else:
+            w_disc_eff = w_disc
         for _inner in range(num_inner):
             optimizer.zero_grad()
             L_A = router.augmented_lagrangian(
@@ -92,6 +100,7 @@ def optimize_augmented_lagrangian(
                 w_wl=w_wl,
                 w_conn=w_conn,
                 w_flow=w_flow,
+                w_disc=w_disc_eff,
                 connectivity=connectivity,
                 connectivity_solver=connectivity_solver,
                 conn_net_batch=conn_net_batch,

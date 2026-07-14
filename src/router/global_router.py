@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from src.rrg.rrg import RRG
 from src.router.connectivity import (
+    effective_resistance_loss_batched,
     effective_resistance_loss_for_net,
     effective_resistance_loss_for_net_undirected,
 )
@@ -87,6 +88,11 @@ class GlobalRouter(nn.Module):
         self.net_names: List[str] = []
         self.nets: List[Any] = []
 
+    @staticmethod
+    def _compiled_cache_path(net_index_path: str, edge_mode: str) -> str:
+        base = net_index_path[:-3] if net_index_path.endswith(".pt") else net_index_path
+        return f"{base}.{edge_mode}.compiled.pt"
+
     @classmethod
     def load(
         cls,
@@ -95,13 +101,36 @@ class GlobalRouter(nn.Module):
         device: torch.device = None,
         edge_mode: str = "directed",
         verbose: bool = True,
+        use_compiled: bool = True,
     ) -> "GlobalRouter":
-        """Fast path: load pre-built RRG + net index (no Java design)."""
+        """Fast path: load pre-built RRG + net index (no Java design).
+
+        With use_compiled, a one-time compiled cache (big contiguous tensors) is
+        written next to the net index; subsequent loads skip the ~140s net-index
+        deserialize + flat-array build and reload in ~15-20s.
+        """
+        import os as _os
         from src.load_design import load_rrg_fast
         from src.router.net_index import NetIndex
 
         if edge_mode not in ("directed", "undirected"):
             raise ValueError(f"edge_mode must be 'directed' or 'undirected', got {edge_mode!r}")
+
+        compiled_path = cls._compiled_cache_path(net_index_path, edge_mode)
+        if (
+            use_compiled
+            and _os.path.isfile(compiled_path)
+            and _os.path.isfile(net_index_path)
+            and _os.path.getmtime(compiled_path) >= _os.path.getmtime(net_index_path)
+        ):
+            try:
+                return cls.load_compiled(
+                    rrg_path, compiled_path, device=device,
+                    edge_mode=edge_mode, verbose=verbose,
+                )
+            except Exception as exc:  # noqa: BLE001 - fall back to full build
+                if verbose:
+                    print(f"    Compiled cache load failed ({exc}); rebuilding")
 
         router = cls()
         router.device = device or torch.device("cpu")
@@ -139,6 +168,14 @@ class GlobalRouter(nn.Module):
                 f"    Loaded: {router.num_nets} nets, "
                 f"{router.num_vars} variables (edge_mode={edge_mode})"
             )
+        if use_compiled:
+            try:
+                router.save_compiled(compiled_path)
+                if verbose:
+                    print(f"    Saved compiled cache -> {compiled_path}")
+            except Exception as exc:  # noqa: BLE001 - caching is best-effort
+                if verbose:
+                    print(f"    save_compiled failed (non-fatal): {exc}")
         return router
 
     @classmethod
@@ -243,6 +280,137 @@ class GlobalRouter(nn.Module):
             print(f"    Nets to route: {router.num_nets}, total variables: {router.num_vars}")
         return router
 
+    def save_compiled(self, path: str) -> None:
+        """Serialize the built runtime state as a few big contiguous tensors.
+
+        Skips re-deserializing the 274K-tensor net index and re-running the
+        per-net torch.unique loop in _build_flat_arrays on the next load (which
+        together dominate GlobalRouter.load ~140s). Reload via load_compiled.
+        """
+        import os as _os
+        _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+        sink_sizes = [len(s) for s in self.net_sink_tiles]
+        sink_off = torch.zeros(len(sink_sizes) + 1, dtype=torch.long)
+        if sink_sizes:
+            sink_off[1:] = torch.cumsum(torch.tensor(sink_sizes, dtype=torch.long), 0)
+        sink_flat = torch.tensor(
+            [t for s in self.net_sink_tiles for t in s], dtype=torch.long
+        ) if sink_sizes else torch.zeros(0, dtype=torch.long)
+        conn = None
+        if self._conn is not None:
+            conn = {
+                "src_flat": self._conn["src_flat"].cpu(),
+                "sink_flat": self._conn["sink_flat"].cpu(),
+                "col_id": self._conn["col_id"].cpu(),
+                "num_nodes": int(self._conn["num_nodes"]),
+                "num_cols": int(self._conn["num_cols"]),
+            }
+        state = {
+            "compiled_format": 1,
+            "edge_mode": self.edge_mode,
+            "num_nets": self.num_nets,
+            "num_vars": self.num_vars,
+            "num_global_edges": self._num_global_edges,
+            "total_local_nodes": self._total_local_nodes,
+            "device_rows": self.device_rows,
+            "device_cols": self.device_cols,
+            "flat_edge_idx": self._flat_edge_idx.cpu(),
+            "flat_wl": self._flat_wl.cpu(),
+            "flat_u": self._flat_u.cpu(),
+            "flat_v": self._flat_v.cpu(),
+            "flow_demand": self._flow_demand.cpu(),
+            "d2p": None if self._d2p is None else self._d2p.cpu(),
+            "phys_capacity": self._phys_capacity_tensor.cpu(),
+            "var_offset": torch.tensor(self._var_offset, dtype=torch.long),
+            "node_offset": torch.tensor(self._node_offset, dtype=torch.long),
+            "net_src_tile": torch.tensor(self.net_src_tile, dtype=torch.long),
+            "net_fanout": torch.tensor(self.net_fanout, dtype=torch.long),
+            "net_bbox": torch.tensor(self.net_bbox, dtype=torch.long),
+            "sink_flat": sink_flat,
+            "sink_off": sink_off,
+            "net_names": self.net_names,
+            "conn": conn,
+        }
+        torch.save(state, path)
+
+    @classmethod
+    def load_compiled(
+        cls,
+        rrg_path: str,
+        compiled_path: str,
+        device: torch.device = None,
+        edge_mode: str = "directed",
+        verbose: bool = True,
+    ) -> "GlobalRouter":
+        """Fast reload from a save_compiled() cache (skips NetIndex + flat build)."""
+        from src.load_design import load_rrg_fast
+
+        router = cls()
+        router.device = device or torch.device("cpu")
+        router.edge_mode = edge_mode
+        dev = router.device
+
+        rrg, drows, dcols, c2i, _fmt = load_rrg_fast(
+            rrg_path, edge_mode=edge_mode, device=dev
+        )
+        router.rrg = rrg
+        router.device_rows = drows
+        router.device_cols = dcols
+        router.coord_to_int = c2i
+        router._build_int_tile_prefix_sum()
+
+        st = torch.load(compiled_path, map_location="cpu")
+        if st.get("edge_mode") != edge_mode:
+            raise ValueError(
+                f"compiled cache edge_mode={st.get('edge_mode')} != {edge_mode}"
+            )
+        router.num_nets = int(st["num_nets"])
+        router.num_vars = int(st["num_vars"])
+        router._num_global_edges = int(st["num_global_edges"])
+        router._total_local_nodes = int(st["total_local_nodes"])
+        router._flat_edge_idx = st["flat_edge_idx"].to(dev)
+        router._flat_wl = st["flat_wl"].to(dev)
+        router._flat_u = st["flat_u"].to(dev)
+        router._flat_v = st["flat_v"].to(dev)
+        router._flow_demand = st["flow_demand"].to(dev)
+        router._d2p = None if st["d2p"] is None else st["d2p"].to(dev)
+        router._phys_capacity_tensor = st["phys_capacity"].to(dev)
+        router._idx_dtype = router._flat_edge_idx.dtype
+        router._var_offset = st["var_offset"].tolist()
+        router._node_offset = st["node_offset"].tolist()
+        router.net_src_tile = st["net_src_tile"].tolist()
+        router.net_fanout = st["net_fanout"].tolist()
+        router.net_bbox = [tuple(r) for r in st["net_bbox"].tolist()]
+        so = st["sink_off"].tolist()
+        sf = st["sink_flat"].tolist()
+        router.net_sink_tiles = [sf[so[i]:so[i + 1]] for i in range(router.num_nets)]
+        router.net_names = list(st["net_names"])
+        router.nets = [None] * router.num_nets
+        if st["conn"] is None:
+            router._conn = None
+        else:
+            c = st["conn"]
+            router._conn = {
+                "flat_u": router._flat_u,
+                "flat_v": router._flat_v,
+                "src_flat": c["src_flat"].to(dev),
+                "sink_flat": c["sink_flat"].to(dev),
+                "col_id": c["col_id"].to(dev),
+                "num_nodes": int(c["num_nodes"]),
+                "num_cols": int(c["num_cols"]),
+            }
+        # Per-net edge views for extraction: slices of the flat array (no compute).
+        vo = router._var_offset
+        fe = router._flat_edge_idx
+        router.net_edge_indices = [fe[vo[i]:vo[i + 1]] for i in range(router.num_nets)]
+        router._net_edge_tensors = router.net_edge_indices
+        if verbose:
+            print(
+                f"    Loaded compiled: {router.num_nets} nets, "
+                f"{router.num_vars} variables (edge_mode={edge_mode})"
+            )
+        return router
+
     def attach_design(self, design: Any) -> None:
         """Attach Java net objects by name (required before detailed routing)."""
         from src.router.net_index import _net_name
@@ -281,12 +449,6 @@ class GlobalRouter(nn.Module):
 
         caps = self.rrg._phys_capacity_tensor.to(self.device)
         self._phys_capacity_tensor = caps
-        if self.edge_mode == "directed":
-            self._phys_de_indices_gpu = [
-                t.to(self.device) for t in self.rrg._phys_de_indices
-            ]
-        else:
-            self._phys_de_indices_gpu = None
         self._init_edge_weight_tensors()
 
     def _build_net_list_from_design(self, design: Any) -> None:
@@ -371,54 +533,144 @@ class GlobalRouter(nn.Module):
         self.num_vars = self._var_offset[-1]
 
     def _finish_net_setup(self) -> None:
+        n_glob = (
+            self.rrg.num_directed_edges
+            if self.edge_mode == "directed"
+            else len(self.rrg.phys_list)
+        )
+        idx_dtype = torch.int32 if n_glob < (1 << 31) else torch.long
+        self._idx_dtype = idx_dtype
         self._net_edge_tensors = []
         for edge_list in self.net_edge_indices:
             self._net_edge_tensors.append(
-                torch.tensor(edge_list, device=self.device, dtype=torch.long)
+                torch.tensor(edge_list, device=self.device, dtype=idx_dtype)
             )
         caps = self.rrg._phys_capacity_tensor.to(self.device)
         self._phys_capacity_tensor = caps
-        if self.edge_mode == "directed":
-            self._phys_de_indices_gpu = [
-                t.to(self.device) for t in self.rrg._phys_de_indices
-            ]
-        else:
-            self._phys_de_indices_gpu = None
         self._init_edge_weight_tensors()
 
     def _init_edge_weight_tensors(self) -> None:
-        """Precompute per-edge WL scores and per-net slices."""
+        """Precompute per-edge WL scores, then all flattened loss tensors."""
         if self.edge_mode == "undirected":
             self._directed_wl = None
-            phys_wl = self.rrg._phys_wl_score_tensor.to(self.device)
-            self._net_wl_tensors = []
-            for edge_list in self.net_edge_indices:
-                if not edge_list:
-                    self._net_wl_tensors.append(
-                        torch.zeros(0, device=self.device, dtype=torch.float32)
-                    )
-                else:
-                    idx = torch.tensor(edge_list, device=self.device, dtype=torch.long)
-                    self._net_wl_tensors.append(phys_wl[idx])
-            return
+            edge_wl = self.rrg._phys_wl_score_tensor.to(self.device)
+        else:
+            pid = torch.tensor(self.rrg.phys_id_of_directed, dtype=torch.long)
+            self._directed_wl = self.rrg._phys_wl_score_tensor[pid].to(self.device)
+            edge_wl = self._directed_wl
+        self._build_flat_arrays(edge_wl)
 
-        directed_wl = torch.ones(
-            self.rrg.num_directed_edges,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        for de_idx, phys in enumerate(self.rrg.phys_edge_of_directed):
-            directed_wl[de_idx] = float(self.rrg.phys_edge_wl_score.get(phys, 1))
-        self._directed_wl = directed_wl
-        self._net_wl_tensors: List[torch.Tensor] = []
-        for edge_list in self.net_edge_indices:
-            if not edge_list:
-                self._net_wl_tensors.append(
-                    torch.zeros(0, device=self.device, dtype=torch.float32)
-                )
+    def _build_flat_arrays(self, edge_wl: torch.Tensor) -> None:
+        """Flatten all per-net structures into single contiguous tensors.
+
+        Built once at setup so every loss term is a handful of vectorized ops:
+        - _flat_edge_idx [num_vars]: global (directed or phys) edge id per var
+        - _flat_wl       [num_vars]: WL score per var
+        - _flat_u/_flat_v [num_vars]: flattened *local* node ids (per-net node
+          blocks laid out consecutively, offsets in _node_offset)
+        - _flow_demand [total_local_nodes]: Kirchhoff demand vector
+        - _conn: batched connectivity RHS layout (one column per (net, sink))
+        - _d2p [num_directed_edges]: directed edge -> phys edge id (directed)
+        """
+        dev = self.device
+        idx_dtype = getattr(self, "_idx_dtype", torch.long)
+        if self.edge_mode == "directed":
+            endpoints = torch.tensor(self.rrg.directed_edges, dtype=torch.long)
+            self._num_global_edges = self.rrg.num_directed_edges
+            self._d2p = torch.tensor(
+                self.rrg.phys_id_of_directed, dtype=idx_dtype, device=dev
+            )
+        else:
+            endpoints = torch.tensor(self.rrg.phys_list, dtype=torch.long)
+            self._num_global_edges = len(self.rrg.phys_list)
+            self._d2p = None
+
+        if self.num_nets > 0 and self.num_vars > 0:
+            flat_edge = torch.cat([t.cpu() for t in self._net_edge_tensors])
+        else:
+            flat_edge = torch.zeros(0, dtype=idx_dtype)
+        self._flat_edge_idx = flat_edge.to(dev, dtype=idx_dtype)
+        self._flat_wl = edge_wl[self._flat_edge_idx]
+
+        flat_u_l: List[torch.Tensor] = []
+        flat_v_l: List[torch.Tensor] = []
+        demand_idx_l: List[torch.Tensor] = []
+        demand_val_l: List[torch.Tensor] = []
+        src_flat_l: List[torch.Tensor] = []
+        sink_flat_l: List[torch.Tensor] = []
+        col_l: List[torch.Tensor] = []
+        node_offset = [0]
+        node_base = 0
+        total_cols = 0
+
+        for i in range(self.num_nets):
+            e = self._net_edge_tensors[i].cpu()
+            if e.numel() == 0:
+                node_offset.append(node_base)
+                continue
+            uv = endpoints[e]
+            nodes, inv = torch.unique(uv, return_inverse=True)
+            n = int(nodes.numel())
+            flat_u_l.append(inv[:, 0] + node_base)
+            flat_v_l.append(inv[:, 1] + node_base)
+
+            src = int(self.net_src_tile[i])
+            sinks = torch.tensor(self.net_sink_tiles[i], dtype=torch.long)
+            spos = int(torch.searchsorted(nodes, torch.tensor(src, dtype=torch.long)))
+            src_in = spos < n and int(nodes[spos]) == src
+            if sinks.numel() > 0:
+                pos = torch.searchsorted(nodes, sinks).clamp(max=n - 1)
+                ok = nodes[pos] == sinks
             else:
-                idx = torch.tensor(edge_list, device=self.device, dtype=torch.long)
-                self._net_wl_tensors.append(directed_wl[idx])
+                pos = sinks
+                ok = torch.zeros(0, dtype=torch.bool)
+
+            if src_in and sinks.numel() > 0:
+                demand_idx_l.append(torch.tensor([node_base + spos]))
+                demand_val_l.append(
+                    torch.tensor([-float(sinks.numel())], dtype=torch.float32)
+                )
+            if bool(ok.any()):
+                sink_pos = pos[ok] + node_base
+                demand_idx_l.append(sink_pos)
+                demand_val_l.append(torch.ones(sink_pos.numel(), dtype=torch.float32))
+                if src_in and n >= 2:
+                    k = int(ok.sum())
+                    src_flat_l.append(
+                        torch.full((k,), node_base + spos, dtype=torch.long)
+                    )
+                    sink_flat_l.append(sink_pos)
+                    col_l.append(
+                        torch.arange(total_cols, total_cols + k, dtype=torch.long)
+                    )
+                    total_cols += k
+
+            node_base += n
+            node_offset.append(node_base)
+
+        self._total_local_nodes = node_base
+        self._node_offset = node_offset
+        empty = torch.zeros(0, dtype=idx_dtype, device=dev)
+        self._flat_u = torch.cat(flat_u_l).to(dev, dtype=idx_dtype) if flat_u_l else empty
+        self._flat_v = torch.cat(flat_v_l).to(dev, dtype=idx_dtype) if flat_v_l else empty
+
+        demand = torch.zeros(max(node_base, 1), dtype=torch.float32)
+        if demand_idx_l:
+            demand.index_add_(0, torch.cat(demand_idx_l), torch.cat(demand_val_l))
+        self._flow_demand = demand[:node_base].to(dev)
+
+        if total_cols > 0:
+            self._conn = {
+                "flat_u": self._flat_u,
+                "flat_v": self._flat_v,
+                "src_flat": torch.cat(src_flat_l).to(dev, dtype=idx_dtype),
+                "sink_flat": torch.cat(sink_flat_l).to(dev, dtype=idx_dtype),
+                "col_id": torch.cat(col_l).to(dev, dtype=idx_dtype),
+                "num_nodes": node_base,
+                "num_cols": total_cols,
+            }
+        else:
+            self._conn = None
 
     def _build_int_tile_prefix_sum(self) -> None:
         grid = np.zeros((self.device_rows, self.device_cols), dtype=np.int64)
@@ -509,20 +761,27 @@ class GlobalRouter(nn.Module):
         )
 
     def init_variables(self) -> torch.Tensor:
-        x = torch.zeros(self.num_vars, device=self.device, dtype=torch.float32)
-        for i in range(self.num_nets):
-            start, end = self._var_offset[i], self._var_offset[i + 1]
-            x[start:end] = 0.1 / (end - start)
+        offsets = torch.tensor(self._var_offset, dtype=torch.long)
+        sizes = offsets[1:] - offsets[:-1]
+        nonzero = sizes.clamp_min(1)
+        x = torch.repeat_interleave(0.1 / nonzero.to(torch.float32), sizes).to(self.device)
         return x.requires_grad_(True)
 
     def wirelength_loss(self, x: torch.Tensor) -> torch.Tensor:
-        loss = torch.tensor(0.0, device=self.device, dtype=x.dtype)
-        for i in range(self.num_nets):
-            start, end = self._var_offset[i], self._var_offset[i + 1]
-            if end <= start:
-                continue
-            loss = loss + (x[start:end] * self._net_wl_tensors[i]).sum()
-        return loss
+        if self.num_vars == 0:
+            return torch.tensor(0.0, device=self.device, dtype=x.dtype)
+        return (x * self._flat_wl).sum()
+
+    def discretization_loss(self, x: torch.Tensor) -> torch.Tensor:
+        """Penalize fractional x: sum x*(1-x), minimized at x in {0,1}.
+
+        Drives the relaxed solution to commit to discrete paths instead of
+        spreading flow diffusely across many weak edges (which stays congested
+        and is not cleanly routable). Typically annealed up over iterations.
+        """
+        if self.num_vars == 0:
+            return torch.tensor(0.0, device=self.device, dtype=x.dtype)
+        return (x * (1.0 - x)).sum()
 
     def flow_conservation_loss(
         self,
@@ -532,11 +791,20 @@ class GlobalRouter(nn.Module):
         if self.edge_mode == "undirected":
             return torch.tensor(0.0, device=self.device, dtype=x.dtype)
 
-        loss = torch.tensor(0.0, device=self.device, dtype=x.dtype)
-        net_indices = range(self.num_nets)
         if net_batch > 0 and net_batch < self.num_nets:
-            net_indices = torch.randperm(self.num_nets, device=self.device)[:net_batch].tolist()
+            return self._flow_conservation_loss_sampled(x, net_batch)
 
+        if self._total_local_nodes == 0:
+            return torch.tensor(0.0, device=self.device, dtype=x.dtype)
+        flow = torch.zeros(self._total_local_nodes, device=self.device, dtype=x.dtype)
+        flow = flow.index_add(0, self._flat_v, x).index_add(0, self._flat_u, -x)
+        imbalance = flow - self._flow_demand.to(x.dtype)
+        return (imbalance * imbalance).sum()
+
+    def _flow_conservation_loss_sampled(self, x: torch.Tensor, net_batch: int) -> torch.Tensor:
+        """Legacy per-net subsampled flow loss (net_batch > 0)."""
+        loss = torch.tensor(0.0, device=self.device, dtype=x.dtype)
+        net_indices = torch.randperm(self.num_nets, device=self.device)[:net_batch].tolist()
         for i in net_indices:
             start, end = self._var_offset[i], self._var_offset[i + 1]
             loss = loss + flow_conservation_loss_for_net(
@@ -548,40 +816,22 @@ class GlobalRouter(nn.Module):
                 self.rrg.num_tiles,
                 self.device,
             )
-        if net_batch > 0 and net_batch < self.num_nets:
-            loss = loss * (self.num_nets / net_batch)
-        return loss
+        return loss * (self.num_nets / net_batch)
 
     def _get_usage_and_overflows(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        usage = torch.zeros(self._num_global_edges, device=self.device, dtype=x.dtype)
+        if self.num_vars > 0:
+            usage = usage.scatter_add(0, self._flat_edge_idx, x)
+
         if self.edge_mode == "undirected":
-            num_phys = len(self.rrg.phys_list)
-            usage = torch.zeros(num_phys, device=self.device, dtype=x.dtype)
-            for i in range(self.num_nets):
-                start, end = self._var_offset[i], self._var_offset[i + 1]
-                indices = self._net_edge_tensors[i]
-                if indices.numel() == 0:
-                    continue
-                usage.scatter_add_(0, indices, x[start:end])
             overflows = torch.relu(usage - self._phys_capacity_tensor)
             return usage, overflows
 
-        usage = torch.zeros(
-            self.rrg.num_directed_edges,
-            device=self.device,
-            dtype=x.dtype,
-        )
-        for i in range(self.num_nets):
-            start, end = self._var_offset[i], self._var_offset[i + 1]
-            indices = self._net_edge_tensors[i]
-            if indices.numel() == 0:
-                continue
-            usage.scatter_add_(0, indices, x[start:end])
-
-        overflows = []
-        for de_idxs, cap in zip(self._phys_de_indices_gpu, self._phys_capacity_tensor):
-            total = usage[de_idxs].sum()
-            overflows.append(torch.relu(total - cap))
-        return usage, torch.stack(overflows) if overflows else torch.zeros(0, device=self.device)
+        num_phys = len(self.rrg.phys_list)
+        phys_usage = torch.zeros(num_phys, device=self.device, dtype=x.dtype)
+        phys_usage = phys_usage.index_add(0, self._d2p, usage)
+        overflows = torch.relu(phys_usage - self._phys_capacity_tensor)
+        return usage, overflows
 
     def congestion_loss(self, x: torch.Tensor, penalty: str = "soft") -> torch.Tensor:
         _, overflows = self._get_usage_and_overflows(x)
@@ -591,9 +841,44 @@ class GlobalRouter(nn.Module):
         self,
         x: torch.Tensor,
         eps: float = 1e-6,
-        solver: str = "solve",
+        solver: str = "cg",
         net_batch: int = 0,
     ) -> torch.Tensor:
+        if solver == "grouped":
+            from src.router.connectivity_grouped import effective_resistance_loss_grouped
+            if getattr(self, "_grouped_vo", None) is None:
+                self._grouped_vo = torch.tensor(
+                    self._var_offset, dtype=torch.long, device=self.device)
+                self._grouped_no = torch.tensor(
+                    self._node_offset, dtype=torch.long, device=self.device)
+                self._grouped_gcache = {}
+                # warm-start cache persists across AL iterations (enable via conn_warm_start)
+                self._grouped_ws = {} if getattr(self, "conn_warm_start", True) else None
+            return effective_resistance_loss_grouped(
+                x,
+                self._conn,
+                self._grouped_vo,
+                self._grouped_no,
+                eps=eps,
+                cg_max_iter=getattr(self, "conn_cg_max_iter", 100),
+                cg_tol=getattr(self, "conn_cg_tol", 1e-5),
+                col_chunk=getattr(self, "conn_col_chunk", 128),
+                precond=getattr(self, "conn_precond", "none"),
+                ws_cache=self._grouped_ws,
+                _group_cache=self._grouped_gcache,
+            )
+
+        if solver == "cg":
+            return effective_resistance_loss_batched(
+                x,
+                self._conn,
+                eps=eps,
+                cg_max_iter=getattr(self, "conn_cg_max_iter", 100),
+                cg_tol=getattr(self, "conn_cg_tol", 1e-5),
+                col_chunk=getattr(self, "conn_col_chunk", 8),
+                edge_chunk=getattr(self, "conn_edge_chunk", 0),
+            )
+
         loss = torch.tensor(0.0, device=self.device, dtype=x.dtype)
         net_indices = range(self.num_nets)
         if net_batch > 0 and net_batch < self.num_nets:
@@ -635,7 +920,7 @@ class GlobalRouter(nn.Module):
         w_conn: float = 1.0,
         w_flow: float = 1.0,
         connectivity: str = "effective_resistance",
-        connectivity_solver: str = "solve",
+        connectivity_solver: str = "cg",
         conn_net_batch: int = 0,
         flow_net_batch: int = 0,
     ) -> torch.Tensor:
@@ -658,8 +943,9 @@ class GlobalRouter(nn.Module):
         w_wl: float = 1.0,
         w_conn: float = 1.0,
         w_flow: float = 1.0,
+        w_disc: float = 0.0,
         connectivity: str = "effective_resistance",
-        connectivity_solver: str = "solve",
+        connectivity_solver: str = "cg",
         conn_net_batch: int = 0,
         flow_net_batch: int = 0,
     ) -> torch.Tensor:
@@ -671,7 +957,10 @@ class GlobalRouter(nn.Module):
         _, overflows = self._get_usage_and_overflows(x)
         penalty_linear = (lam * overflows).sum()
         penalty_quad = (rho / 2) * (overflows ** 2).sum()
-        return w_wl * wl + w_conn * conn + w_flow * flow + penalty_linear + penalty_quad
+        total = w_wl * wl + w_conn * conn + w_flow * flow + penalty_linear + penalty_quad
+        if w_disc != 0.0:
+            total = total + w_disc * self.discretization_loss(x)
+        return total
 
     def optimize_augmented_lagrangian(self, **kwargs) -> torch.Tensor:
         from src.router.augmented_lagrangian import optimize_augmented_lagrangian
@@ -679,26 +968,21 @@ class GlobalRouter(nn.Module):
         return optimize_augmented_lagrangian(self, **kwargs)
 
     def get_congestion_map(self, x: torch.Tensor) -> np.ndarray:
-        usage, _ = self._get_usage_and_overflows(x)
-        usage_np = usage.detach().cpu().numpy()
+        with torch.no_grad():
+            usage, _ = self._get_usage_and_overflows(x)
+            if self.edge_mode == "undirected":
+                phys_usage = usage
+            else:
+                num_phys = len(self.rrg.phys_list)
+                phys_usage = torch.zeros(num_phys, device=self.device, dtype=usage.dtype)
+                phys_usage = phys_usage.index_add(0, self._d2p, usage)
+            caps = self._phys_capacity_tensor.clamp_min(1e-12)
+            cong = (phys_usage / caps).cpu().numpy()
 
+        endpoints = np.asarray(self.rrg.phys_list, dtype=np.int64).reshape(-1, 2)
         tile_cong = np.zeros(self.rrg.num_tiles, dtype=np.float32)
-        if self.edge_mode == "undirected":
-            for phys_id, phys in enumerate(self.rrg.phys_list):
-                cap = float(self._phys_capacity_tensor[phys_id].item())
-                flow = float(usage_np[phys_id])
-                cong = flow / cap if cap > 0 else 0.0
-                a, b = phys
-                tile_cong[a] = max(tile_cong[a], cong)
-                tile_cong[b] = max(tile_cong[b], cong)
-        else:
-            for phys, de_idxs in self.rrg.phys_to_directed.items():
-                cap = self.rrg.phys_capacity[phys]
-                flow = sum(usage_np[j] for j in de_idxs)
-                cong = flow / cap if cap > 0 else 0.0
-                a, b = phys
-                tile_cong[a] = max(tile_cong[a], cong)
-                tile_cong[b] = max(tile_cong[b], cong)
+        np.maximum.at(tile_cong, endpoints[:, 0], cong)
+        np.maximum.at(tile_cong, endpoints[:, 1], cong)
 
         grid = np.zeros((self.device_rows, self.device_cols), dtype=np.float32)
         for idx, (row, col, *_) in enumerate(self.rrg.tiles):

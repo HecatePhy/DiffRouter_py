@@ -28,6 +28,7 @@ class RRG:
         self.coord_to_idx = tile_graph["coord_to_idx"]
         self.tiles = tile_graph["tiles"]
         self.num_tiles = len(self.tiles)
+        self._build_device_coord_index()
         undir_edges = tile_graph["edges"]
         edge_dist = tile_graph.get("edge_dist", {})
         edge_wl = tile_graph.get("edge_wl_score", {})
@@ -68,6 +69,7 @@ class RRG:
             (int(rows[i]), int(cols[i]), None, "", bool(is_int[i]))
             for i in range(n_tiles)
         ]
+        self._build_device_coord_index()
 
         self.coord_to_idx: Dict[Tuple[int, int], int] = {}
         if "int_interchange" in data:
@@ -230,13 +232,72 @@ class RRG:
                 )
         print(f"RRG capacity log saved to: {log_path}")
 
+    def _build_device_coord_index(self) -> None:
+        """Map device grid (row, col) -> tile list index (used for bbox/corridor)."""
+        self.device_coord_to_idx: Dict[Tuple[int, int], int] = {}
+        for idx, t in enumerate(self.tiles):
+            self.device_coord_to_idx[(int(t[0]), int(t[1]))] = idx
+
+    def tile_coords(self, idx: int) -> Tuple[int, int]:
+        """Interchange grid (row, col) for INT tile index."""
+        t = self.tiles[idx]
+        return int(t[0]), int(t[1])
+
+    def get_edges_in_corridor(
+        self,
+        src_idx: int,
+        sink_idxs: List[int],
+        half_width: int = 2,
+    ) -> List[int]:
+        """L-shaped corridors src->each sink (H band at src row + V band at sink col)."""
+        if self.edge_mode != "directed":
+            raise RuntimeError("get_edges_in_corridor requires edge_mode='directed'")
+        sr, sc = self.tile_coords(src_idx)
+        seen: set = set()
+        result: List[int] = []
+
+        def add_rect(mc0: int, mc1: int, mr0: int, mr1: int) -> None:
+            for de in self.get_edges_in_bbox(mc0, mc1, mr0, mr1):
+                if de not in seen:
+                    seen.add(de)
+                    result.append(de)
+
+        for sink_idx in sink_idxs:
+            kr, kc = self.tile_coords(int(sink_idx))
+            add_rect(min(sc, kc), max(sc, kc), sr - half_width, sr + half_width)
+            add_rect(kc - half_width, kc + half_width, min(sr, kr), max(sr, kr))
+        return result
+
+    def get_phys_edges_in_corridor(
+        self,
+        src_idx: int,
+        sink_idxs: List[int],
+        half_width: int = 2,
+    ) -> List[int]:
+        """Undirected phys-edge ids in L-shaped corridors."""
+        sr, sc = self.tile_coords(src_idx)
+        seen: set = set()
+        result: List[int] = []
+
+        def add_rect(mc0: int, mc1: int, mr0: int, mr1: int) -> None:
+            for pe in self.get_phys_edges_in_bbox(mc0, mc1, mr0, mr1):
+                if pe not in seen:
+                    seen.add(pe)
+                    result.append(pe)
+
+        for sink_idx in sink_idxs:
+            kr, kc = self.tile_coords(int(sink_idx))
+            add_rect(min(sc, kc), max(sc, kc), sr - half_width, sr + half_width)
+            add_rect(kc - half_width, kc + half_width, min(sr, kr), max(sr, kr))
+        return sorted(result)
+
     def _bbox_tile_set(
         self, min_col: int, max_col: int, min_row: int, max_row: int
     ) -> set:
         bbox_tiles = set()
         for row in range(min_row, max_row + 1):
             for col in range(min_col, max_col + 1):
-                idx = self.coord_to_idx.get((row, col))
+                idx = self.device_coord_to_idx.get((row, col))
                 if idx is not None:
                     bbox_tiles.add(idx)
         return bbox_tiles

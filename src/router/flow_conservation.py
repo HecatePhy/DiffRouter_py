@@ -23,14 +23,22 @@ def compute_node_imbalances(
     (K = number of sinks). Indexed by global tile id (0 .. num_tiles-1).
     """
     dtype = x_slice.dtype
-    in_flow = torch.zeros(num_tiles, device=device, dtype=dtype)
-    out_flow = torch.zeros(num_tiles, device=device, dtype=dtype)
+    if torch.is_tensor(edge_list):
+        e = edge_list.to(device=device, dtype=torch.long)
+    else:
+        e = torch.tensor(list(edge_list), device=device, dtype=torch.long)
+    if torch.is_tensor(directed_edges):
+        uv = directed_edges.to(device=device, dtype=torch.long)[e]
+    else:
+        uv = torch.tensor(
+            [directed_edges[int(i)] for i in e.tolist()],
+            device=device,
+            dtype=torch.long,
+        ).reshape(-1, 2)
 
-    for k, de_idx in enumerate(edge_list):
-        u, v = directed_edges[de_idx]
-        val = x_slice[k]
-        out_flow[u] = out_flow[u] + val
-        in_flow[v] = in_flow[v] + val
+    net_flow = torch.zeros(num_tiles, device=device, dtype=dtype)
+    net_flow = net_flow.index_add(0, uv[:, 1], x_slice)
+    net_flow = net_flow.index_add(0, uv[:, 0], -x_slice)
 
     demand = torch.zeros(num_tiles, device=device, dtype=dtype)
     if 0 <= src < num_tiles and sinks:
@@ -39,7 +47,7 @@ def compute_node_imbalances(
         if 0 <= sink < num_tiles:
             demand[sink] = demand[sink] + 1.0
 
-    return in_flow - out_flow - demand
+    return net_flow - demand
 
 
 def flow_conservation_penalty(imbalance: torch.Tensor) -> torch.Tensor:

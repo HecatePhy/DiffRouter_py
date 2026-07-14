@@ -23,6 +23,12 @@ def main():
     parser.add_argument("--min-fanout", type=int, default=0)
     parser.add_argument("--expansion-ratio", type=float, default=0.1)
     parser.add_argument("--edge-mode", choices=["directed", "undirected"], default="directed")
+    parser.add_argument("--edge-scope", choices=["bbox", "corridor"], default="corridor",
+                        help="Net edge region: full bbox or L-shaped src->sink corridors")
+    parser.add_argument("--corridor-width", type=int, default=2,
+                        help="Half-width (tiles) of L-shaped routing corridors")
+    parser.add_argument("--max-edges-per-net", type=int, default=50000,
+                        help="Skip net if corridor cannot fit within this edge cap (0=unlimited)")
     parser.add_argument("--max-nets", type=int, default=None)
     parser.add_argument("--net-index", default=None, help="Output path (default: auto under data/<testcase>/net_index/)")
     parser.add_argument(
@@ -47,6 +53,9 @@ def main():
         args.min_fanout,
         args.expansion_ratio,
         route_filter=route_filter,
+        edge_scope=args.edge_scope,
+        corridor_width=args.corridor_width,
+        max_edges_per_net=args.max_edges_per_net,
     )
 
     print(f"Pre-building net index -> {cache_path}")
@@ -68,6 +77,9 @@ def main():
         edge_mode=args.edge_mode,
         max_nets=args.max_nets,
         route_filter=route_filter,
+        edge_scope=args.edge_scope,
+        corridor_width=args.corridor_width,
+        max_edges_per_net=args.max_edges_per_net,
         use_java=args.use_java,
         design=design,
         verbose=True,

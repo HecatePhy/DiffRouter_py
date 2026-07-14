@@ -32,14 +32,19 @@ def _net_index_path(args) -> str:
         args.min_fanout,
         0.1,
         route_filter="stubs",
+        edge_scope=args.edge_scope,
+        corridor_width=args.corridor_width,
+        max_edges_per_net=args.max_edges_per_net,
     )
 
 
 def _prebuild_hint(args) -> str:
+    cap = f" --max-edges-per-net {args.max_edges_per_net}" if args.max_edges_per_net else ""
     return (
         f"python scripts/PrebuildNetIndex.py --testcase {args.testcase} "
         f"--rrg {args.rrg} --edge-mode {args.edge_mode} "
-        f"--min-fanout {args.min_fanout}"
+        f"--min-fanout {args.min_fanout} --edge-scope {args.edge_scope} "
+        f"--corridor-width {args.corridor_width}{cap}"
     )
 
 
@@ -50,7 +55,7 @@ def _load_router(args, device):
         with Timer("load_design", logger=print):
             design = load_design(physical_path, netlist_path)
         with Timer("build_router", logger=print):
-            return GlobalRouter.load_live(
+            router = GlobalRouter.load_live(
                 design,
                 args.rrg,
                 device=device,
@@ -59,17 +64,27 @@ def _load_router(args, device):
                 max_nets=args.max_nets,
                 verbose=not args.quiet,
             )
+        router.conn_col_chunk = getattr(args, "conn_col_chunk", 32)
+        router.conn_cg_max_iter = getattr(args, "conn_cg_max_iter", 100)
+        router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 0)
+        router.conn_warm_start = getattr(args, "conn_warm_start", True)
+        return router
     from src.router.net_index import require_net_index_path
 
     net_index = require_net_index_path(_net_index_path(args), _prebuild_hint(args))
     with Timer("build_router", logger=print):
-        return GlobalRouter.load(
+        router = GlobalRouter.load(
             args.rrg,
             net_index,
             device=device,
             edge_mode=args.edge_mode,
             verbose=not args.quiet,
         )
+    router.conn_col_chunk = getattr(args, "conn_col_chunk", 32)
+    router.conn_cg_max_iter = getattr(args, "conn_cg_max_iter", 100)
+    router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 0)
+    router.conn_warm_start = getattr(args, "conn_warm_start", True)
+    return router
 
 
 def run_pipeline(args) -> dict:
@@ -133,6 +148,8 @@ def run_pipeline(args) -> dict:
                 w_wl=args.w_wl,
                 w_conn=args.w_conn,
                 w_flow=w_flow,
+                w_disc=args.w_disc,
+                disc_ramp_outer=args.disc_ramp_outer,
                 connectivity_solver=args.connectivity_solver,
                 conn_net_batch=args.conn_net_batch,
                 flow_net_batch=args.flow_net_batch,
@@ -230,18 +247,40 @@ def main():
     parser.add_argument("--rho", type=float, default=1.0)
     parser.add_argument("--w-wl", type=float, default=1.0)
     parser.add_argument("--w-conn", type=float, default=1.0)
+    parser.add_argument("--w-disc", type=float, default=0.0,
+                        help="Discretization penalty weight (sum x*(1-x)); drives x to {0,1}")
+    parser.add_argument("--disc-ramp-outer", type=int, default=0,
+                        help="Anneal w_disc from 0 to full over this many outer iters (0=constant)")
     parser.add_argument("--w-flow", type=float, default=1.0)
     parser.add_argument("--edge-mode", choices=["directed", "undirected"], default="directed",
                         help="Edge variables: directed arcs or undirected phys edges (no flow term)")
     parser.add_argument("--net-index", default=None, help="Path to pre-built net index .pt")
     parser.add_argument("--live-build-nets", action="store_true",
                         help="Debug: build net list from design (requires Java load)")
-    parser.add_argument("--connectivity-solver", choices=["solve", "cg"], default="solve")
+    parser.add_argument("--route-threshold", type=float, default=0.01,
+                        help="Min edge weight for route extraction")
+    parser.add_argument("--connectivity-solver", choices=["solve", "cg", "grouped"], default="cg",
+                        help="grouped = net-grouped subgraph CG (fast + low memory at scale)")
+    parser.add_argument("--conn-warm-start", action="store_true", default=True,
+                        help="grouped solver: warm-start CG from previous iter's solution")
+    parser.add_argument("--no-conn-warm-start", dest="conn_warm_start", action="store_false")
     parser.add_argument("--conn-net-batch", type=int, default=0,
-                        help="Sample N nets per iter for connectivity (0=all)")
+                        help="Legacy: per-net solve subsample (ignored when solver=cg)")
+    parser.add_argument("--conn-edge-chunk", type=int, default=0,
+                        help="Bound connectivity Laplacian matvec temporary to "
+                             "[edge_chunk, col_chunk] rows; 0 = no chunking. "
+                             "Set ~8000000 for large designs to avoid OOM.")
+    parser.add_argument("--conn-col-chunk", type=int, default=32,
+                        help="Sink columns per CG chunk (lower = less GPU memory)")
+    parser.add_argument("--conn-cg-max-iter", type=int, default=100)
+    parser.add_argument("--edge-scope", choices=["bbox", "corridor"], default="corridor",
+                        help="Net edge region: full bbox or L-shaped src->sink corridors")
+    parser.add_argument("--corridor-width", type=int, default=2,
+                        help="Half-width (tiles) of L-shaped routing corridors")
+    parser.add_argument("--max-edges-per-net", type=int, default=50000,
+                        help="Skip net if corridor cannot fit within this edge cap (0=unlimited)")
     parser.add_argument("--flow-net-batch", type=int, default=0,
                         help="Sample N nets per iter for flow penalty (0=all)")
-    parser.add_argument("--route-threshold", type=float, default=0.01)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--resume", default=None, help="Checkpoint path to resume global opt")
     parser.add_argument("--auto-resume", action="store_true")
