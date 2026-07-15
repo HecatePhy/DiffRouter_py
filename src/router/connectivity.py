@@ -117,7 +117,7 @@ def _laplacian_matvec(
     flat_v: torch.Tensor,
     V: torch.Tensor,
     eps: float,
-    edge_chunk: int = 0,
+    edge_chunk: int = 8_000_000,
 ) -> torch.Tensor:
     """(L + eps*I) @ V for the block-diagonal Laplacian over all nets.
 
@@ -157,7 +157,7 @@ def _cg_block(
     eps: float,
     max_iter: int,
     tol: float,
-    edge_chunk: int = 0,
+    edge_chunk: int = 8_000_000,
 ) -> torch.Tensor:
     """Batched CG for (L + eps*I) Z = B with per-column convergence tracking."""
     X = torch.zeros_like(B)
@@ -258,7 +258,7 @@ def effective_resistance_loss_batched(
     cg_tol: float = 1e-5,
     col_chunk: int = 8,
     weight_floor: float = 1e-8,
-    edge_chunk: int = 0,
+    edge_chunk: int = 8_000_000,
 ) -> torch.Tensor:
     """All-nets effective resistance loss via batched CG + implicit diff.
 

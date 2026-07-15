@@ -88,10 +88,13 @@ run_mode() { # benchmark mode
   # ---- 1. global route
   if [ ! -f "$res/$b/checkpoint/global_x.pt" ]; then
     log "$b/$mode: global route"
+    # Keep these in lockstep with the README's flow-mode commands: the campaign must
+    # measure exactly the configuration we document.
     local extra="--conn-every 5"
     [ "$mode" = "runtime" ] && extra="--conn-every 5 --conn-super-sink --conn-multi-gpu $NGPU"
     /usr/bin/time -v python -u run_exp.py --testcase "$b" --global-only \
-        --rrg "$RRG" --connectivity-solver grouped --conn-warm-start $extra \
+        --rrg "$RRG" --connectivity-solver grouped --conn-warm-start \
+        --conn-col-chunk 128 --conn-cg-max-iter 8 $extra \
         --max-iterations "$ITERS" --num-inner 5 --skip-extract \
         --early-stop-tol "$EARLY_STOP_TOL" \
         --guide-out "$guide" --results "$res/" > "$gl" 2>&1

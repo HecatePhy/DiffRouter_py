@@ -65,11 +65,12 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", "-q", action="store_true", help="Run optimization only with logs")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint .pt")
     parser.add_argument("--save-every", type=int, default=0, help="Save checkpoint every N iters")
-    parser.add_argument("--connectivity-solver", choices=["solve", "cg"], default="cg")
+    parser.add_argument("--connectivity-solver", choices=["solve", "cg", "grouped"], default="grouped",
+                        help="grouped = net-grouped subgraph CG (default; fast + low memory at scale)")
     parser.add_argument("--conn-net-batch", type=int, default=0)
-    parser.add_argument("--conn-col-chunk", type=int, default=32)
-    parser.add_argument("--conn-cg-max-iter", type=int, default=100)
-    parser.add_argument("--conn-edge-chunk", type=int, default=0,
+    parser.add_argument("--conn-col-chunk", type=int, default=128)
+    parser.add_argument("--conn-cg-max-iter", type=int, default=8)
+    parser.add_argument("--conn-edge-chunk", type=int, default=8_000_000,
                         help="Bound connectivity matvec temporary to [edge_chunk, col_chunk] "
                              "rows; 0=off. Use ~8000000 for large designs to avoid OOM.")
     parser.add_argument("--flow-net-batch", type=int, default=0)

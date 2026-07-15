@@ -938,7 +938,7 @@ class GlobalRouter(nn.Module):
                 self._grouped_vo,
                 self._grouped_no,
                 eps=eps,
-                cg_max_iter=getattr(self, "conn_cg_max_iter", 100),
+                cg_max_iter=getattr(self, "conn_cg_max_iter", 8),
                 cg_tol=getattr(self, "conn_cg_tol", 1e-5),
                 col_chunk=getattr(self, "conn_col_chunk", 128),
                 precond=getattr(self, "conn_precond", "none"),
@@ -952,10 +952,10 @@ class GlobalRouter(nn.Module):
                 x,
                 self._conn,
                 eps=eps,
-                cg_max_iter=getattr(self, "conn_cg_max_iter", 100),
+                cg_max_iter=getattr(self, "conn_cg_max_iter", 8),
                 cg_tol=getattr(self, "conn_cg_tol", 1e-5),
-                col_chunk=getattr(self, "conn_col_chunk", 8),
-                edge_chunk=getattr(self, "conn_edge_chunk", 0),
+                col_chunk=getattr(self, "conn_col_chunk", 128),
+                edge_chunk=getattr(self, "conn_edge_chunk", 8_000_000),
             )
 
         loss = torch.tensor(0.0, device=self.device, dtype=x.dtype)
@@ -999,7 +999,7 @@ class GlobalRouter(nn.Module):
         w_conn: float = 1.0,
         w_flow: float = 1.0,
         connectivity: str = "effective_resistance",
-        connectivity_solver: str = "cg",
+        connectivity_solver: str = "grouped",
         conn_net_batch: int = 0,
         flow_net_batch: int = 0,
     ) -> torch.Tensor:
@@ -1024,7 +1024,7 @@ class GlobalRouter(nn.Module):
         w_flow: float = 1.0,
         w_disc: float = 0.0,
         connectivity: str = "effective_resistance",
-        connectivity_solver: str = "cg",
+        connectivity_solver: str = "grouped",
         conn_net_batch: int = 0,
         flow_net_batch: int = 0,
     ) -> torch.Tensor:

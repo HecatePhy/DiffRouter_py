@@ -47,7 +47,8 @@ Max-connectivity global route → tight Dijkstra path guide → strong guide pen
 ```bash
 # 1. global route + guide (guide is written inline from the in-memory router)
 python run_exp.py --testcase boom_soc_v2 --global-only \
-    --connectivity-solver grouped --conn-warm-start --conn-every 5 \
+    --connectivity-solver grouped --conn-warm-start \
+    --conn-col-chunk 128 --conn-cg-max-iter 8 --conn-every 5 \
     --max-iterations 60 --num-inner 5 \
     --guide-out bsv2.guide --skip-extract
 
@@ -65,6 +66,7 @@ Fastest global route → same tight Dijkstra guide → gentle penalty.
 # 1. global route + guide: conn-every + super-sink + multi-GPU
 python run_exp.py --testcase boom_soc_v2 --global-only \
     --connectivity-solver grouped --conn-warm-start \
+    --conn-col-chunk 128 --conn-cg-max-iter 8 \
     --conn-every 5 --conn-super-sink --conn-multi-gpu 4 \
     --max-iterations 60 --num-inner 5 \
     --guide-out bsv2.guide --skip-extract
