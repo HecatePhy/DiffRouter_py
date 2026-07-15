@@ -68,6 +68,11 @@ def _load_router(args, device):
         router.conn_cg_max_iter = getattr(args, "conn_cg_max_iter", 100)
         router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 0)
         router.conn_warm_start = getattr(args, "conn_warm_start", True)
+        router.conn_max_sinks = getattr(args, "conn_max_sinks", 0)
+        router.conn_super_sink = getattr(args, "conn_super_sink", False)
+        _ng = getattr(args, "conn_multi_gpu", 1)
+        router.conn_mg_devices = (
+            [torch.device("cuda:%d" % i) for i in range(_ng)] if _ng > 1 else None)
         return router
     from src.router.net_index import require_net_index_path
 
@@ -84,6 +89,11 @@ def _load_router(args, device):
     router.conn_cg_max_iter = getattr(args, "conn_cg_max_iter", 100)
     router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 0)
     router.conn_warm_start = getattr(args, "conn_warm_start", True)
+    router.conn_max_sinks = getattr(args, "conn_max_sinks", 0)
+    router.conn_super_sink = getattr(args, "conn_super_sink", False)
+    _ng = getattr(args, "conn_multi_gpu", 1)
+    router.conn_mg_devices = (
+        [torch.device("cuda:%d" % i) for i in range(_ng)] if _ng > 1 else None)
     return router
 
 
@@ -150,6 +160,8 @@ def run_pipeline(args) -> dict:
                 w_flow=w_flow,
                 w_disc=args.w_disc,
                 disc_ramp_outer=args.disc_ramp_outer,
+                conn_every=args.conn_every,
+                conn_freeze_outer=args.conn_freeze_outer,
                 connectivity_solver=args.connectivity_solver,
                 conn_net_batch=args.conn_net_batch,
                 flow_net_batch=args.flow_net_batch,
@@ -169,7 +181,23 @@ def run_pipeline(args) -> dict:
         metrics["global_final_loss"] = final_loss.item()
         print(f"  Global final loss: {final_loss.item():.4f}")
 
+    # --- Potter GR guide (inline: reuses the loaded router, no reload/round-trip) ---
+    if args.guide_out:
+        from src.router.gpu_guide import export_guide
+
+        with Timer("guide", logger=print):
+            metrics["guide_nets"] = export_guide(router, x_opt, args.guide_out)
+            metrics["guide_out"] = args.guide_out
+
     # --- Route extraction ---
+    if args.skip_extract:
+        print("  Skipping route extraction (--skip-extract)")
+        metrics_path = os.path.join(result_dir, "metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"[Done] metrics: {metrics_path}")
+        return metrics
+
     with Timer("extract", logger=print):
         cong_map = router.get_congestion_map(x_opt)
         extractor = RouteExtractor(threshold=args.route_threshold)
@@ -259,6 +287,12 @@ def main():
                         help="Debug: build net list from design (requires Java load)")
     parser.add_argument("--route-threshold", type=float, default=0.01,
                         help="Min edge weight for route extraction")
+    parser.add_argument("--guide-out", default="",
+                        help="Write a Potter GR route guide here, inline after global "
+                             "routing (GPU batched shortest paths; reuses the loaded "
+                             "router, so no reload round-trip)")
+    parser.add_argument("--skip-extract", action="store_true",
+                        help="Skip tile-path extraction (not needed when using --guide-out)")
     parser.add_argument("--connectivity-solver", choices=["solve", "cg", "grouped"], default="cg",
                         help="grouped = net-grouped subgraph CG (fast + low memory at scale)")
     parser.add_argument("--conn-warm-start", action="store_true", default=True,
@@ -273,6 +307,19 @@ def main():
     parser.add_argument("--conn-col-chunk", type=int, default=32,
                         help="Sink columns per CG chunk (lower = less GPU memory)")
     parser.add_argument("--conn-cg-max-iter", type=int, default=100)
+    parser.add_argument("--conn-max-sinks", type=int, default=0,
+                        help="Cap connectivity to first K sinks/net (0=all). Cheap runtime "
+                             "lever: huge-fanout nets dominate connectivity cost.")
+    parser.add_argument("--conn-every", type=int, default=1,
+                        help="A1: evaluate connectivity every K inner iters (1=every step)")
+    parser.add_argument("--conn-freeze-outer", type=int, default=0,
+                        help="A2: stop evaluating connectivity after this outer iter (0=never)")
+    parser.add_argument("--conn-super-sink", action="store_true",
+                        help="B1: 1 connectivity column/net (source->merged super-sink)")
+    parser.add_argument("--conn-bf16", action="store_true",
+                        help="B4: run the connectivity CG in bfloat16")
+    parser.add_argument("--conn-multi-gpu", type=int, default=1,
+                        help="B2: shard connectivity groups across N GPUs (cuda:0..N-1)")
     parser.add_argument("--edge-scope", choices=["bbox", "corridor"], default="corridor",
                         help="Net edge region: full bbox or L-shaped src->sink corridors")
     parser.add_argument("--corridor-width", type=int, default=2,

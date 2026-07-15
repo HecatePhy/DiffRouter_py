@@ -51,6 +51,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", type=int, default=1)
     ap.add_argument("--rrg", default="data/rrg_xcvu3p_int.pt")
+    ap.add_argument("--testcase", default="boom_soc_v2")
     ap.add_argument("--x", nargs="+", required=True,
                     help="label=path/to/global_x.pt pairs")
     args = ap.parse_args()
@@ -58,7 +59,7 @@ def main():
     from src.router.global_router import GlobalRouter
     from src.router.net_index import default_net_index_path
     dev = torch.device(f"cuda:{args.gpu}")
-    ni = default_net_index_path("./data/", "boom_soc_v2", args.rrg, "directed", 0, 0.1,
+    ni = default_net_index_path("./data/", args.testcase, args.rrg, "directed", 0, 0.1,
                                 route_filter="stubs", edge_scope="corridor",
                                 corridor_width=2, max_edges_per_net=50000)
     t0 = time.time()

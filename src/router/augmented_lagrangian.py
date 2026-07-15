@@ -30,6 +30,8 @@ def optimize_augmented_lagrangian(
     w_flow: float = 1.0,
     w_disc: float = 0.0,
     disc_ramp_outer: int = 0,
+    conn_every: int = 1,
+    conn_freeze_outer: int = 0,
     connectivity: str = "effective_resistance",
     connectivity_solver: str = "cg",
     conn_net_batch: int = 0,
@@ -91,14 +93,20 @@ def optimize_augmented_lagrangian(
             w_disc_eff = w_disc * min(1.0, outer / float(disc_ramp_outer))
         else:
             w_disc_eff = w_disc
+        # A2: freeze connectivity after it has converged (conn_freeze_outer>0).
+        conn_frozen = conn_freeze_outer > 0 and outer >= conn_freeze_outer
         for _inner in range(num_inner):
             optimizer.zero_grad()
+            # A1: evaluate the (expensive) connectivity term only every conn_every
+            # inner steps; other steps optimize wirelength/congestion/flow only.
+            include_conn = (not conn_frozen) and (total_iter % conn_every == 0)
+            w_conn_step = w_conn if include_conn else 0.0
             L_A = router.augmented_lagrangian(
                 x,
                 lam,
                 rho,
                 w_wl=w_wl,
-                w_conn=w_conn,
+                w_conn=w_conn_step,
                 w_flow=w_flow,
                 w_disc=w_disc_eff,
                 connectivity=connectivity,
