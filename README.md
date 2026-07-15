@@ -24,8 +24,9 @@ ln -sf "$PWD/data/xcvu3p.device" third_party/Potter/xcvu3p.device
 
 This produces `third_party/Potter/build/route`. Needs cmake, a C++17 compiler, zlib and
 boost-serialization (Cap'n Proto is bundled with Potter). The patch itself is
-`potter/0001-diffrouter-gr-guidance.patch`; see [`docs/POTTER_INTEGRATION.md`](docs/POTTER_INTEGRATION.md)
-for what it changes and why.
+`potter/0001-diffrouter-gr-guidance.patch` — it adds the `-g/--guide` and
+`--guide_penalty` options, a soft out-of-guide term in the A* node cost, and net-name
+capture so guides can be matched to nets.
 
 ### The two modes
 
@@ -91,7 +92,6 @@ It is the main dial between the two modes:
 | ~1 | trade-off |
 | ~2+ | strong adherence — best wirelength, slower routing (routes forced into corridors) |
 
-Potter integration (patch + build): see [`docs/POTTER_INTEGRATION.md`](docs/POTTER_INTEGRATION.md).
 
 ---
 

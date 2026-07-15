@@ -20,7 +20,7 @@ cd "$ROOT"
 CONDA_ENV="${CONDA_ENV:-diffrouter}"
 if [ -z "${CONDA_SH:-}" ]; then
   for c in "$HOME/miniforge3" "$(dirname "$(dirname "$(command -v conda 2>/dev/null || echo /nonexistent)")")" \
-           /home/usr1/"$USER"/miniforge3 "$HOME/miniconda3" "$HOME/anaconda3"; do
+           "$HOME/miniconda3" "$HOME/anaconda3"; do
     [ -f "$c/etc/profile.d/conda.sh" ] && { CONDA_SH="$c/etc/profile.d/conda.sh"; break; }
   done
 fi
@@ -31,7 +31,7 @@ fi
 python -c "import torch" 2>/dev/null || {
   echo "ERROR: no torch in '$(command -v python)'. Set CONDA_SH=/path/to/conda.sh CONDA_ENV=<env>."; exit 1; }
 
-POTTER="${POTTER:-/tmp/claude-5033/-home-usr1-xg3787-projs-DiffRouter-py/4dd12ae8-e3ff-4789-826a-5238420035fd/scratchpad/Potter}"
+POTTER="${POTTER:-$ROOT/third_party/Potter}"   # built by potter/setup_potter.sh
 OUT="${OUT:-$ROOT/campaign}"
 THREADS="${THREADS:-32}"
 ITERS="${ITERS:-60}"
@@ -40,6 +40,13 @@ MODES="${MODES:-both}"
 RRG="${RRG:-data/rrg_xcvu3p_int.pt}"
 DEV="${DEV:-data/xcvu3p.device}"
 SKIP_UNGUIDED="${SKIP_UNGUIDED:-0}"
+
+if [ ! -x "$POTTER/build/route" ]; then
+  echo "ERROR: no Potter binary at $POTTER/build/route"
+  echo "       run potter/setup_potter.sh first, or set POTTER=/path/to/Potter"
+  exit 1
+fi
+if [ ! -f "$DEV" ]; then echo "ERROR: device file not found: $DEV"; exit 1; fi
 EARLY_STOP_TOL="${EARLY_STOP_TOL:-0.01}"   # adapt iters per design (0 disables)
 
 # default: every benchmark that has an unrouted .phys, smallest first (fail fast)
