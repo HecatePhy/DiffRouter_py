@@ -40,6 +40,7 @@ MODES="${MODES:-both}"
 RRG="${RRG:-data/rrg_xcvu3p_int.pt}"
 DEV="${DEV:-data/xcvu3p.device}"
 SKIP_UNGUIDED="${SKIP_UNGUIDED:-0}"
+EARLY_STOP_TOL="${EARLY_STOP_TOL:-0.01}"   # adapt iters per design (0 disables)
 
 # default: every benchmark that has an unrouted .phys, smallest first (fail fast)
 if [ -z "${BENCH:-}" ]; then
@@ -77,6 +78,7 @@ run_mode() { # benchmark mode
     /usr/bin/time -v python -u run_exp.py --testcase "$b" --global-only \
         --rrg "$RRG" --connectivity-solver grouped --conn-warm-start $extra \
         --max-iterations "$ITERS" --num-inner 5 --skip-extract \
+        --early-stop-tol "$EARLY_STOP_TOL" \
         --guide-out "$guide" --results "$res/" > "$gl" 2>&1
   fi
   t_g=$(secs "$gl")

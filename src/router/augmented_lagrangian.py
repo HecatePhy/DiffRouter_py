@@ -32,6 +32,8 @@ def optimize_augmented_lagrangian(
     disc_ramp_outer: int = 0,
     conn_every: int = 1,
     conn_freeze_outer: int = 0,
+    early_stop_tol: float = 0.0,
+    early_stop_patience: int = 3,
     connectivity: str = "effective_resistance",
     connectivity_solver: str = "cg",
     conn_net_batch: int = 0,
@@ -85,7 +87,14 @@ def optimize_augmented_lagrangian(
 
     if log_setup:
         print("  [4e] Starting outer loop (Augmented Lagrangian)...")
+        if early_stop_tol > 0:
+            print(
+                f"  [4e] Early stop armed: overflow improvement < "
+                f"{early_stop_tol*100:.1f}% over {early_stop_patience} outers "
+                f"(after rho reaches {rho_max})"
+            )
 
+    ovf_hist: list = []
     for outer in range(start_outer, num_outer):
         # Anneal discretization weight from 0 to w_disc over disc_ramp_outer outers
         # (establish connectivity first, then sharpen to discrete paths).
@@ -156,6 +165,30 @@ def optimize_augmented_lagrangian(
             rho = min(rho * rho_mult, rho_max)
             if verbose:
                 print(f"      [rho] Increased to {rho:.2f}")
+
+        # Early stop on AL convergence. Overflow (the constraint violation) is already
+        # computed above for the lambda update, so this costs nothing. A fixed
+        # max-iterations is design-size-dependent: it over-runs small designs and
+        # under-runs large ones. Stopping when overflow stops improving adapts to both.
+        #
+        # Only arm once rho has reached rho_max: overflow legitimately RISES while the
+        # penalty ramps (flow spreads before it is squeezed), so an earlier check would
+        # fire on that transient.
+        if early_stop_tol > 0:
+            ovf_hist.append(float(overflows.sum().item()))
+            if rho >= rho_max and len(ovf_hist) > early_stop_patience:
+                window = ovf_hist[-(early_stop_patience + 1):]
+                base = max(window[0], 1e-12)
+                improvement = (window[0] - window[-1]) / base
+                if improvement < early_stop_tol:
+                    if verbose:
+                        print(
+                            f"      [early-stop] outer {outer+1} (iter {total_iter}): "
+                            f"overflow improved {improvement*100:.2f}% over last "
+                            f"{early_stop_patience} outers (< {early_stop_tol*100:.1f}%); "
+                            f"overflow_sum={window[-1]:.4g}"
+                        )
+                    break
 
         if verbose and (outer + 1) % 20 == 0:
             wl = router.wirelength_loss(x).item()

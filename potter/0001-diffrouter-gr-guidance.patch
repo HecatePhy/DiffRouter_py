@@ -1,0 +1,193 @@
+diff --git a/src/db/database.cpp b/src/db/database.cpp
+index a233edf..233dce0 100644
+--- a/src/db/database.cpp
++++ b/src/db/database.cpp
+@@ -361,4 +361,42 @@ void Database::checkRoute() {
+             nodeUsage[nodeId] = conn.getNetId();
+         }
+     }
+-}
+\ No newline at end of file
++}
++// DiffRouter GR guidance: load per-net route guide (tile set). File format, one
++// line per net:  <net_name> <ntiles> row,col row,col ...
++// DiffRouter uses (row, col); Potter tile X<-col, Y<-row (verify orientation).
++void Database::loadGuide() {
++    if (guideFile.empty()) return;
++    std::unordered_map<std::string, int> nameToNetId;
++    nameToNetId.reserve(netNames.size() * 2);
++    for (size_t i = 0; i < netNames.size(); i++) nameToNetId[netNames[i]] = (int)i;
++    netGuideTiles.assign(nets.size(), std::unordered_set<uint32_t>());
++    std::ifstream in(guideFile);
++    if (!in.good()) {
++        log() << "WARNING: could not open guide file " << guideFile << std::endl;
++        return;
++    }
++    std::string line;
++    long matched = 0, missing = 0, cells = 0;
++    while (std::getline(in, line)) {
++        if (line.empty()) continue;
++        std::istringstream ss(line);
++        std::string name; int ntiles = 0;
++        ss >> name >> ntiles;
++        auto it = nameToNetId.find(name);
++        int netId = (it == nameToNetId.end()) ? -1 : it->second;
++        if (netId < 0) missing++;
++        else matched++;
++        std::string tok;
++        for (int k = 0; k < ntiles; k++) {
++            if (!(ss >> tok)) break;
++            auto comma = tok.find(',');
++            if (comma == std::string::npos) continue;
++            int row = std::stoi(tok.substr(0, comma));
++            int col = std::stoi(tok.substr(comma + 1));
++            if (netId >= 0) { netGuideTiles[netId].insert(tileKey(col, row)); cells++; }
++        }
++    }
++    log() << "GR guide loaded: " << matched << " nets matched, " << missing
++          << " unmatched, " << cells << " guide tiles, penalty=" << guidePenalty << std::endl;
++}
+diff --git a/src/db/database.h b/src/db/database.h
+index f61b632..dfc2ce0 100644
+--- a/src/db/database.h
++++ b/src/db/database.h
+@@ -13,14 +13,20 @@
+ #include <unistd.h>
+ #include <sys/stat.h>
+ #include <filesystem>
++#include <unordered_set>
++#include <unordered_map>
++#include <string>
+ 
+ class Database
+ {
+ public:
+-	Database() : layout(0, 0, 108, 300), device(routingGraph), 
+-		netlist(device, nets, indirectConnections, directConnections, preservedNodes, routingGraph, layout){}
++	Database() : layout(0, 0, 108, 300), device(routingGraph),
++		netlist(device, nets, netNames, indirectConnections, directConnections, preservedNodes, routingGraph, layout){}
+ 	void readDevice(string deviceName);
+ 	void readNetlist(string netlistName);
++	// DiffRouter GR guidance: soft per-net route guide (set of tile keys). See
++	// loadGuide(); consumed in aStarRoute::getNodeCost as a soft cost penalty.
++	void loadGuide();
+ 	void writeNetlist(string netlistName, const vector<RouteResult>& nodeRoutingResults) {netlist.write(netlistName, nodeRoutingResults);}
+ 	void reduceRouteNode();
+ 	void setRouteNodeChildren();
+@@ -32,8 +38,24 @@ public:
+ 	vector<Connection> indirectConnections;
+ 	vector<Connection> directConnections;
+ 	vector<Net> nets;
++	vector<std::string> netNames;  // netId -> net name (for guide lookup)
+ 	vector<bool> preservedNodes;
+ 
++	// GR guidance (DiffRouter). netGuideTiles[netId] = allowed tile keys; empty
++	// = no guide for that net. guidePenalty scales the soft out-of-guide cost.
++	std::string guideFile;
++	float guidePenalty = 2.0f;
++	std::vector<std::unordered_set<uint32_t>> netGuideTiles;
++	static inline uint32_t tileKey(int x, int y) {
++		return ((uint32_t)(uint16_t)x << 16) | (uint16_t)y;
++	}
++	// FNV-1a 64 over a net name (must match the Python exporter byte-for-byte).
++	static inline uint64_t nameHash(const std::string& s) {
++		uint64_t h = 0xcbf29ce484222325ULL;
++		for (unsigned char c : s) { h ^= c; h *= 0x100000001b3ULL; }
++		return h;
++	}
++
+ 	RouteNodeGraph routingGraph;
+ 	int numNodes = 0;
+ 	int numNodesInRRG = 0;
+diff --git a/src/db/netlist.cpp b/src/db/netlist.cpp
+index 42a8ec1..7e73013 100644
+--- a/src/db/netlist.cpp
++++ b/src/db/netlist.cpp
+@@ -342,6 +342,7 @@ void Netlist::parseNetlist(string netlist_file)
+             }
+ 			nets[netNum].setId(netNum);
+ 			nets[netNum].setOriId(net_idx);
++            netNames.push_back(str_list[phys_net.getName()]);  // netId -> name (for GR guide)
+             netNum ++;
+         } else {
+             // preserve clk and static net
+diff --git a/src/db/netlist.h b/src/db/netlist.h
+index 5c89f02..67269f9 100644
+--- a/src/db/netlist.h
++++ b/src/db/netlist.h
+@@ -15,9 +15,10 @@
+ namespace Raw {
+ class Netlist {
+ public:
+-	Netlist(Device& dvc, vector<Net>& nets_, vector<Connection>& indirectConnections_, vector<Connection>& directConnections_, vector<bool>& preservedNodes_, RouteNodeGraph& routingGraph_, utils::BoxT<int> layout_) : 
++	Netlist(Device& dvc, vector<Net>& nets_, vector<std::string>& netNames_, vector<Connection>& indirectConnections_, vector<Connection>& directConnections_, vector<bool>& preservedNodes_, RouteNodeGraph& routingGraph_, utils::BoxT<int> layout_) :
+ 		device(dvc),
+ 		nets(nets_),
++		netNames(netNames_),
+ 		indirectConnections(indirectConnections_),
+ 		directConnections(directConnections_),
+ 		preservedNodes(preservedNodes_),
+@@ -75,6 +76,7 @@ private:
+ 
+     Device& device;
+ 	vector<Net>& nets;
++	vector<std::string>& netNames;
+ 	vector<Connection>& indirectConnections;
+ 	vector<Connection>& directConnections;
+ 	RouteNodeGraph& routingGraph;
+diff --git a/src/main.cpp b/src/main.cpp
+index 4ea516f..9dd5656 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -29,7 +29,9 @@ int main(int argc, char **argv) {
+ 		("o,output", "[REQUIRED] The output (routed) physical netlist", cxxopts::value<std::string>())
+ 		("d,device", "The device file", cxxopts::value<std::string>()->default_value("xcvu3p.device"))
+ 		("t,thread", "The number of threads", cxxopts::value<int>()->default_value("32"))
+-		("r,runtime_first", "Enable runtime first mode", cxxopts::value<bool>()->implicit_value("true")->default_value("false"));
++		("r,runtime_first", "Enable runtime first mode", cxxopts::value<bool>()->implicit_value("true")->default_value("false"))
++		("g,guide", "DiffRouter GR route-guide file (soft per-net corridor)", cxxopts::value<std::string>()->default_value(""))
++		("guide_penalty", "Soft penalty for leaving the GR guide", cxxopts::value<float>()->default_value("2.0"));
+ 
+ 	auto result = options.parse(argc, argv);
+ 
+@@ -57,10 +59,13 @@ int main(int argc, char **argv) {
+ 	log() << "runtime first: " << (result["runtime_first"].as<bool>() ? "true" : "false") << endl;
+ 	log() << endl;
+ 
+-	Database database;	
++	Database database;
+ 	database.setNumThread(numThread);
++	database.guideFile = result["guide"].as<std::string>();
++	database.guidePenalty = result["guide_penalty"].as<float>();
+ 	database.readDevice(deviceName); // TODO: try to load pre-computed device file
+-	database.readNetlist(inputName);		
++	database.readNetlist(inputName);
++	database.loadGuide();   // DiffRouter GR guidance (no-op if --guide not given)
+ 	database.setRouteNodeChildren();
+ 	database.printStatistic();
+ 
+diff --git a/src/route/aStarRoute.cpp b/src/route/aStarRoute.cpp
+index 77ca863..4d6b5e8 100644
+--- a/src/route/aStarRoute.cpp
++++ b/src/route/aStarRoute.cpp
+@@ -682,7 +682,19 @@ double aStarRoute::getNodeCost(RouteNode* rnode, const Connection& connection, i
+                 (std::fabs(rnode->getEndTileXCoordinate() - net.getXCenter()) + std::fabs(rnode->getEndTileYCoordinate() - net.getYCenter())) / net.getDoubleHpwl();
+     }
+ 
+-	return rnode->getBaseCost() * rnode->getHistoricalCongestionCost() * presentCongestionCost / sharingFactor + biasCost;
++	// DiffRouter GR guide: soft penalty for leaving the net's global-route corridor.
++	// Soft (not a hard wall) so a net can still escape a locally-infeasible guide.
++	double guideCost = 0;
++	if (!isTarget && !database.netGuideTiles.empty()) {
++		const auto& guide = database.netGuideTiles[connection.getNetId()];
++		if (!guide.empty()) {
++			uint32_t key = Database::tileKey(rnode->getEndTileXCoordinate(), rnode->getEndTileYCoordinate());
++			if (guide.find(key) == guide.end())
++				guideCost = database.guidePenalty * rnode->getBaseCost();
++		}
++	}
++
++	return rnode->getBaseCost() * rnode->getHistoricalCongestionCost() * presentCongestionCost / sharingFactor + biasCost + guideCost;
+ }
+ 
+ /**

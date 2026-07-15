@@ -10,16 +10,33 @@ detailed router) — see [Flow Modes](#flow-modes-diffrouter--potter).
 ## Flow Modes (DiffRouter → Potter)
 
 The global route can be exported as a **GR route guide** for Potter, which routes each
-net preferring its guide corridor. Two presets for the whole flow:
+net preferring its guide corridor.
+
+### Setting up Potter (one-time)
+
+Potter is a separate BSD-3 project. We vendor only our patch (which adds `-g/--guide`
+and `--guide_penalty`), not their source, so it stays easy to track upstream:
+
+```bash
+potter/setup_potter.sh                 # clone at pinned commit + apply patch + build
+ln -sf "$PWD/data/xcvu3p.device" third_party/Potter/xcvu3p.device
+```
+
+This produces `third_party/Potter/build/route`. Needs cmake, a C++17 compiler, zlib and
+boost-serialization (Cap'n Proto is bundled with Potter). The patch itself is
+`potter/0001-diffrouter-gr-guidance.patch`; see [`docs/POTTER_INTEGRATION.md`](docs/POTTER_INTEGRATION.md)
+for what it changes and why.
+
+### The two modes
 
 | mode | global route | Potter penalty | optimizes for |
 |------|-------------|----------------|---------------|
 | **(1) cpwl-driven** | max-connectivity (`--conn-every 5`) | 2 (strong) | critical-path wirelength |
 | **(2) runtime-driven** | fastest (`+ --conn-super-sink --conn-multi-gpu`) | 0.5 (gentle) | end-to-end runtime |
 
-Both modes use the same **tight per-net Dijkstra guide** (`export_potter_guidance.py`);
-they differ in the global-route config and `--guide_penalty`. Guide *tightness* is what
-delivers the benefit — a loose guide is equivalent to no guide (see
+Both modes use the same **tight per-net shortest-path guide** (written inline by
+`--guide-out`); they differ in the global-route config and `--guide_penalty`. Guide
+*tightness* is what delivers the benefit — a loose guide is equivalent to no guide (see
 [Guide export](#guide-export-for-potter)).
 
 ### (1) cpwl-driven — best wirelength
@@ -34,7 +51,7 @@ python run_exp.py --testcase boom_soc_v2 --global-only \
     --guide-out bsv2.guide --skip-extract
 
 # 2. Potter with strong guide adherence
-./Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
+third_party/Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
     -o routed.phys -d data/xcvu3p.device -t 32 -r \
     -g bsv2.guide --guide_penalty 2
 ```
@@ -52,7 +69,7 @@ python run_exp.py --testcase boom_soc_v2 --global-only \
     --guide-out bsv2.guide --skip-extract
 
 # 2. Potter, gentle guide (nudge, not force)
-./Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
+third_party/Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
     -o routed.phys -d data/xcvu3p.device -t 32 -r \
     -g bsv2.guide --guide_penalty 0.5
 ```
@@ -195,6 +212,8 @@ and *columns* rather than arithmetic cost.
 | `--conn-cg-max-iter` | 100 | CG iterations per solve (small values suffice with warm-start) |
 | `--conn-col-chunk` | 32 | Columns per CG chunk (larger amortizes kernel-launch overhead) |
 | `--conn-edge-chunk` | 0 | Bound the CG matvec temporary to `[edge_chunk, col_chunk]` rows — use on large designs to avoid OOM |
+| `--early-stop-tol F` | 0 | Stop when overflow improves < F (e.g. `0.01` = 1%) over `--early-stop-patience` outer iters, once rho has reached `rho_max`. Adapts the iteration count to the design instead of a fixed `--max-iterations` (which is inherently design-size-dependent). Free: overflow is already computed for the λ update |
+| `--early-stop-patience N` | 3 | Outer iters the early-stop improvement is measured over |
 | `--conn-freeze-outer N` | 0 | Stop evaluating connectivity after outer iter N. ⚠️ Not recommended: the later congestion phase then degrades connectivity |
 | `--conn-max-sinks K` | 0 | Cap connectivity to the first K sinks per net |
 | `--conn-bf16` | off | Reserved (solver is launch-bound, so limited benefit) |
@@ -279,6 +298,8 @@ python eval_circuits.py --testcases boom_med_pb boom_soc_v2
 | `scripts/export_potter_guidance.py` | Potter guide: per-net Dijkstra paths + per-connection bboxes (CPU reference) |
 | `scripts/fast_guide_export.py` | Potter guide: per-net corridor via GPU scatter (loose; experimental) |
 | `scripts/run_all_benchmarks.sh` | End-to-end campaign over benchmarks, both modes → `campaign/results.csv` |
+| `potter/setup_potter.sh` | Clone Potter at the pinned commit, apply the GR-guidance patch, build |
+| `potter/0001-diffrouter-gr-guidance.patch` | The Potter-side patch (`-g/--guide`, `--guide_penalty`, soft guide cost in A*) |
 | `scripts/eval_connectivity.py` | Fast quality metric: sink-pair connectivity + overflow (GPU label-prop) |
 | `docs/PAPER_ALIGNMENT.md` | Paper ↔ code mapping |
 | `docs/POTTER_INTEGRATION.md` | DiffRouter → Potter guidance: patch, modes, measurements |
