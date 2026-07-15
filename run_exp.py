@@ -171,17 +171,26 @@ def run_pipeline(args) -> dict:
                 log_setup=not args.quiet,
             )
 
-        final_loss = router.total_loss(
-            x_opt,
-            w_wl=args.w_wl,
-            w_cong=10.0,
-            w_conn=args.w_conn,
-            w_flow=w_flow,
-            connectivity_solver=args.connectivity_solver,
-            conn_net_batch=0,
-        )
-        metrics["global_final_loss"] = final_loss.item()
-        print(f"  Global final loss: {final_loss.item():.4f}")
+        if args.final_loss:
+            # A full connectivity solve over every column, just to report a number.
+            # Off by default: on a large design it costs a whole extra solve (and its
+            # peak memory) after the optimisation has already finished.
+            final_loss = router.total_loss(
+                x_opt,
+                w_wl=args.w_wl,
+                w_cong=10.0,
+                w_conn=args.w_conn,
+                w_flow=w_flow,
+                connectivity_solver=args.connectivity_solver,
+                conn_net_batch=0,
+            )
+            metrics["global_final_loss"] = final_loss.item()
+            print(f"  Global final loss: {final_loss.item():.4f}")
+
+    # The AL warm-start cache holds one CG solution per group (several GB on a large
+    # design) and is useless once the optimisation is done -- free it before the
+    # guide/extraction stages, which need their own working memory.
+    router.free_solver_caches(verbose=not args.quiet)
 
     # --- Potter GR guide (inline: reuses the loaded router, no reload/round-trip) ---
     if args.guide_out:
@@ -295,6 +304,9 @@ def main():
                              "router, so no reload round-trip)")
     parser.add_argument("--skip-extract", action="store_true",
                         help="Skip tile-path extraction (not needed when using --guide-out)")
+    parser.add_argument("--final-loss", action="store_true",
+                        help="Report the full final loss after optimisation. Costs an extra "
+                             "full connectivity solve (all columns) purely for reporting.")
     parser.add_argument("--connectivity-solver", choices=["solve", "cg", "grouped"], default="grouped",
                         help="grouped = net-grouped subgraph CG: each chunk solves only its "
                              "nets' subgraph. Default -- far faster and lower-memory at scale. "

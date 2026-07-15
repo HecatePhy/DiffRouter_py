@@ -1045,6 +1045,31 @@ class GlobalRouter(nn.Module):
             total = total + w_disc * self.discretization_loss(x)
         return total
 
+    def free_solver_caches(self, verbose: bool = False) -> None:
+        """Release the grouped solver's per-group caches.
+
+        The warm-start cache holds one CG solution Z per group, i.e. roughly
+        num_conn_nodes x col_chunk floats in total -- several GB on a large design.
+        It is only useful *between* AL iterations, so anything running after the
+        optimisation (guide export, extraction) is paying for it for nothing. The
+        multi-GPU replicas are per-device copies of the static index arrays.
+        """
+        freed = []
+        # Reset the whole lazily-built group together (_grouped_vo gates the rebuild;
+        # clearing the caches without it would leave the multi-GPU path referencing a
+        # replica dict that no longer exists).
+        for attr in ("_grouped_ws", "_grouped_gcache", "_grouped_vo", "_grouped_no",
+                     "_conn_capped", "_conn_super"):
+            if getattr(self, attr, None) is not None:
+                setattr(self, attr, None)
+                freed.append(attr)
+        if hasattr(self, "_conn_capped_k"):
+            self._conn_capped_k = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if verbose and freed:
+            print(f"    Freed solver caches: {', '.join(freed)}")
+
     def optimize_augmented_lagrangian(self, **kwargs) -> torch.Tensor:
         from src.router.augmented_lagrangian import optimize_augmented_lagrangian
 

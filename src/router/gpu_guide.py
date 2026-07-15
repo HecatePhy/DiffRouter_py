@@ -36,11 +36,14 @@ def compute_guide_paths(
     n_nodes = int(conn["num_nodes"])
 
     # local -> global tile id (every local node is an endpoint of some edge)
-    de = torch.tensor(router.rrg.directed_edges, dtype=torch.long, device=dev)
+    # int32: this is [num_vars, 2] and is the largest tensor the export allocates
+    # (3.3 GB as int64 on a 206M-variable design). Tile ids fit in int32 comfortably.
+    de = torch.tensor(router.rrg.directed_edges, dtype=torch.int32, device=dev)
     guv = de[router._flat_edge_idx.long().to(dev)]
     l2g = torch.zeros(n_nodes, dtype=torch.long, device=dev)
-    l2g[fu] = guv[:, 0]
-    l2g[fv] = guv[:, 1]
+    l2g[fu] = guv[:, 0].long()
+    l2g[fv] = guv[:, 1].long()
+    del de, guv
 
     node_off = torch.tensor(router._node_offset, dtype=torch.long, device=dev)
     src_col = conn["src_flat"].long().to(dev)
@@ -73,28 +76,56 @@ def compute_guide_paths(
     pred = torch.where(big < n_nodes, big, torch.full_like(big, -1))
     pred[src_col] = -1
 
-    # backward walk from every sink at once
+    # Backward walk from every sink at once, deduping (net, tile) as we go.
+    #
+    # Do NOT stack the whole walk: its height is the longest path in *steps*, which
+    # is data-dependent -- a converged x gives ~85, but a partly-optimised one routes
+    # through many low-weight edges and can run into the thousands. [steps, num_cols]
+    # then reaches tens of GB and OOMs. The result we actually want is just the SET of
+    # (net, tile) pairs, which is small (~10 tiles/net), so fold into it incrementally.
+    ntiles = router.rrg.num_tiles
     cur = sink_col.clone()
     alive = torch.ones_like(cur, dtype=torch.bool)
-    rows = [cur.clone()]
-    for _ in range(max_walk):
+    # seed with each net's sink and source tiles
+    acc = torch.unique(torch.cat([
+        col_net * ntiles + l2g[sink_col],
+        col_net * ntiles + l2g[src_col],
+    ]))
+    pending: list = []
+    pending_n = 0
+    FLUSH = 32_000_000   # cap the un-deduped backlog (~256 MB as int64)
+
+    def _fold(acc, pending):
+        if not pending:
+            return acc
+        return torch.unique(torch.cat([acc] + pending))
+
+    steps = 0
+    for steps in range(1, max_walk + 1):
         nxt = torch.where(alive, pred[cur], torch.full_like(cur, -1))
         alive = alive & (nxt >= 0)
         if not bool(alive.any()):
             break
         cur = torch.where(alive, nxt, cur)
-        rows.append(torch.where(alive, cur, torch.full_like(cur, -1)))
-    walk = torch.stack(rows, 0)
-
-    steps, ncols = walk.shape
-    valid = walk >= 0
-    nets_f = col_net.unsqueeze(0).expand(steps, ncols)[valid]
-    tiles_f = l2g[walk[valid].clamp_min(0)]
-    nets_f = torch.cat([nets_f, col_net])          # include each net's source tile
-    tiles_f = torch.cat([tiles_f, l2g[src_col]])
-    ntiles = router.rrg.num_tiles
-    key = torch.unique(nets_f * ntiles + tiles_f)
-    return (key // ntiles), (key % ntiles)
+        k = col_net[alive] * ntiles + l2g[cur[alive]]
+        pending.append(k)
+        pending_n += k.numel()
+        if pending_n >= FLUSH:
+            acc = _fold(acc, pending)
+            pending, pending_n = [], 0
+    acc = _fold(acc, pending)
+    if verbose:
+        print(f"    [guide] backward walk: {steps} steps", flush=True)
+    if steps >= max_walk and bool(alive.any()):
+        # Hitting the cap means some sink never walked back to its source, so those
+        # guides are truncated. A converged x terminates in ~100 steps; needing
+        # thousands means x is still diffuse (low-weight edges are cheap enough that
+        # shortest paths wander), i.e. the global route has not converged.
+        print(f"    [guide] WARNING: {int(alive.sum())} of {alive.numel()} connections "
+              f"still walking at the {max_walk}-step cap -- their guides are truncated. "
+              f"This usually means the global route is under-converged (a converged "
+              f"solution walks back in ~100 steps).", flush=True)
+    return (acc // ntiles), (acc % ntiles)
 
 
 def write_guide(router, net_ids, tile_ids, out_path: str, verbose: bool = True) -> int:
