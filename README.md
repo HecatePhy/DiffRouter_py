@@ -302,7 +302,6 @@ python eval_circuits.py --testcases boom_med_pb boom_soc_v2
 | `potter/0001-diffrouter-gr-guidance.patch` | The Potter-side patch (`-g/--guide`, `--guide_penalty`, soft guide cost in A*) |
 | `scripts/eval_connectivity.py` | Fast quality metric: sink-pair connectivity + overflow (GPU label-prop) |
 | `docs/PAPER_ALIGNMENT.md` | Paper ↔ code mapping |
-| `docs/POTTER_INTEGRATION.md` | DiffRouter → Potter guidance: patch, modes, measurements |
 
 ## Testing
 
