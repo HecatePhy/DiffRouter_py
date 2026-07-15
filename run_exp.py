@@ -162,6 +162,8 @@ def run_pipeline(args) -> dict:
                 disc_ramp_outer=args.disc_ramp_outer,
                 conn_every=args.conn_every,
                 conn_freeze_outer=args.conn_freeze_outer,
+                early_stop_tol=args.early_stop_tol,
+                early_stop_patience=args.early_stop_patience,
                 connectivity_solver=args.connectivity_solver,
                 conn_net_batch=args.conn_net_batch,
                 flow_net_batch=args.flow_net_batch,
@@ -314,6 +316,12 @@ def main():
                         help="A1: evaluate connectivity every K inner iters (1=every step)")
     parser.add_argument("--conn-freeze-outer", type=int, default=0,
                         help="A2: stop evaluating connectivity after this outer iter (0=never)")
+    parser.add_argument("--early-stop-tol", type=float, default=0.0,
+                        help="Stop when overflow improves less than this fraction over "
+                             "--early-stop-patience outer iters (0=disabled, 0.01=1%%). "
+                             "Adapts iteration count to the design instead of a fixed cap.")
+    parser.add_argument("--early-stop-patience", type=int, default=3,
+                        help="Outer iters the early-stop improvement is measured over")
     parser.add_argument("--conn-super-sink", action="store_true",
                         help="B1: 1 connectivity column/net (source->merged super-sink)")
     parser.add_argument("--conn-bf16", action="store_true",
