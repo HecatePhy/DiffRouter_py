@@ -2,6 +2,82 @@
 
 Differentiable global router for FPGA routing (FPGA24 Routing Contest). Uses PyTorch for optimization with Augmented Lagrangian.
 
+Optionally emits **GR route guides** for [Potter](https://github.com/diriLin/Potter) (parallel
+detailed router) — see [Flow Modes](#flow-modes-diffrouter--potter).
+
+---
+
+## Flow Modes (DiffRouter → Potter)
+
+The global route can be exported as a **GR route guide** for Potter, which routes each
+net preferring its guide corridor. Two presets for the whole flow:
+
+| mode | global route | Potter penalty | optimizes for |
+|------|-------------|----------------|---------------|
+| **(1) cpwl-driven** | max-connectivity (`--conn-every 5`) | 2 (strong) | critical-path wirelength |
+| **(2) runtime-driven** | fastest (`+ --conn-super-sink --conn-multi-gpu`) | 0.5 (gentle) | end-to-end runtime |
+
+Both modes use the same **tight per-net Dijkstra guide** (`export_potter_guidance.py`);
+they differ in the global-route config and `--guide_penalty`. Guide *tightness* is what
+delivers the benefit — a loose guide is equivalent to no guide (see
+[Guide export](#guide-export-for-potter)).
+
+### (1) cpwl-driven — best wirelength
+
+Max-connectivity global route → tight Dijkstra path guide → strong guide penalty.
+
+```bash
+# 1. global route + guide (guide is written inline from the in-memory router)
+python run_exp.py --testcase boom_soc_v2 --global-only \
+    --connectivity-solver grouped --conn-warm-start --conn-every 5 \
+    --max-iterations 60 --num-inner 5 \
+    --guide-out bsv2.guide --skip-extract
+
+# 2. Potter with strong guide adherence
+./Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
+    -o routed.phys -d data/xcvu3p.device -t 32 -r \
+    -g bsv2.guide --guide_penalty 2
+```
+
+### (2) runtime-driven — fastest flow
+
+Fastest global route → same tight Dijkstra guide → gentle penalty.
+
+```bash
+# 1. global route + guide: conn-every + super-sink + multi-GPU
+python run_exp.py --testcase boom_soc_v2 --global-only \
+    --connectivity-solver grouped --conn-warm-start \
+    --conn-every 5 --conn-super-sink --conn-multi-gpu 4 \
+    --max-iterations 60 --num-inner 5 \
+    --guide-out bsv2.guide --skip-extract
+
+# 2. Potter, gentle guide (nudge, not force)
+./Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
+    -o routed.phys -d data/xcvu3p.device -t 32 -r \
+    -g bsv2.guide --guide_penalty 0.5
+```
+
+`--guide-out` writes the guide **inline**, reusing the router already in memory — no
+save/reload round-trip. `--skip-extract` skips the tile-path extraction, which the guide
+flow does not need. (`scripts/gpu_guide_export.py` does the same from a saved
+`global_x.pt`, if you want the guide after the fact.)
+
+### Guide penalty = the mode dial
+
+`--guide_penalty` is a **soft** out-of-guide cost added to Potter's A\* node cost
+(TritonRoute/CUGR-style; soft so a net can still escape a locally-infeasible guide).
+It is the main dial between the two modes:
+
+| penalty | behaviour |
+|---------|-----------|
+| ~0.5 | gentle nudge — fastest routing, most of the wirelength gain |
+| ~1 | trade-off |
+| ~2+ | strong adherence — best wirelength, slower routing (routes forced into corridors) |
+
+Potter integration (patch + build): see [`docs/POTTER_INTEGRATION.md`](docs/POTTER_INTEGRATION.md).
+
+---
+
 ## Default Setup (recommended)
 
 DiffRouter targets **FPGA24-style partial routing**: pre-placed designs with some nets already routed in `sources` and remaining work in `stubs` ([contest inputs](https://xilinx.github.io/fpga24_routing_contest/start.html)).
@@ -39,6 +115,15 @@ Implemented in `cpp/build/extract_net_index` and used by default in `scripts/Pre
 
 Net index cache path (auto):  
 `data/<testcase>/net_index/rrg_xcvu3p_int_<edge_mode>_stubs_mf<min_fanout>_exp10.pt`
+
+> **The net index is a one-time, per-testcase local cost that every later run reuses.**
+> Build it once with `scripts/PrebuildNetIndex.py`; `run_exp.py` (and the campaign script)
+> auto-detect the cache and skip rebuilding when it exists. The first `GlobalRouter.load`
+> additionally writes a **compiled cache** (`<net_index>.<edge_mode>.compiled.pt`) of the
+> built flat tensors, so subsequent loads skip both the net-index deserialize and the
+> flat-array build. Neither artifact is shipped in the repo — they are large (GBs per
+> design) and machine-local, so `data/` and `*.pt` are gitignored. Regenerate locally;
+> the C++ extractor needs no Java and is fast.
 
 ### One-time + per-testcase workflow
 
@@ -82,9 +167,9 @@ python run_exp.py --testcase boom_med_pb --viz --max-iterations 200
 | `--testcase` | boom_soc_v2 | Design name under `data/` |
 | `--rrg` | data/rrg_xcvu3p_int.pt | Pre-extracted RRG (C++ Interchange extract) |
 | `--max-iterations` | 1000 | Global AL iterations |
-| `--conn-net-batch` | 0 | Nets per iter for connectivity (0=all) |
+| `--conn-net-batch` | 0 | Legacy: nets per iter for connectivity (0=all; ignored by `cg`/`grouped`) |
 | `--w-flow` | 1.0 | Flow conservation soft penalty weight |
-| `--connectivity-solver` | solve | `solve` or `cg` |
+| `--connectivity-solver` | cg | `solve`, `cg`, or `grouped` (recommended — see below) |
 | `--global-only` | - | Skip detailed routing |
 | `--skip-global` | - | Load cached `global_x.pt` |
 | `--route-threshold` | 0.01 | Edge threshold for path extraction |
@@ -93,6 +178,63 @@ python run_exp.py --testcase boom_med_pb --viz --max-iterations 200
 | `--net-index` | auto path | Pre-built net index `.pt` (required unless `--live-build-nets`) |
 | `--live-build-nets` | - | Debug: build net list from Java design |
 | `--resume` | - | Checkpoint path for global opt |
+
+### Connectivity solver + runtime options
+
+The connectivity (effective-resistance) term dominates global-route runtime. Its grouped
+CG is **kernel-launch-bound**, so the effective levers reduce the *number of evaluations*
+and *columns* rather than arithmetic cost.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--connectivity-solver` | cg | `grouped` = net-grouped subgraph CG (each chunk solves only its nets' subgraph). Far faster and lower-memory than `cg`/`solve` at scale — **recommended** |
+| `--conn-warm-start` | on | Initialize CG from the previous iteration's solution (`x` moves slowly, so few iterations suffice) |
+| `--conn-every K` | 1 | Evaluate connectivity every K inner iters; other steps optimize wirelength/congestion/flow only. Large speedup, connectivity preserved |
+| `--conn-super-sink` | off | One connectivity column per net (source → merged super-sink) instead of one per sink. Much faster and yields a far less congested route; slightly lower sink-pair connectivity |
+| `--conn-multi-gpu N` | 1 | Shard connectivity groups across N GPUs (bit-exact vs single-GPU) |
+| `--conn-cg-max-iter` | 100 | CG iterations per solve (small values suffice with warm-start) |
+| `--conn-col-chunk` | 32 | Columns per CG chunk (larger amortizes kernel-launch overhead) |
+| `--conn-edge-chunk` | 0 | Bound the CG matvec temporary to `[edge_chunk, col_chunk]` rows — use on large designs to avoid OOM |
+| `--conn-freeze-outer N` | 0 | Stop evaluating connectivity after outer iter N. ⚠️ Not recommended: the later congestion phase then degrades connectivity |
+| `--conn-max-sinks K` | 0 | Cap connectivity to the first K sinks per net |
+| `--conn-bf16` | off | Reserved (solver is launch-bound, so limited benefit) |
+
+Use `--conn-every 5` for maximum connectivity; add `--conn-super-sink --conn-multi-gpu 4`
+for the fastest, least-congested route.
+
+### Objective weights
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--w-wl` | 1.0 | Wirelength weight |
+| `--w-conn` | 1.0 | Connectivity (effective resistance) weight |
+| `--w-flow` | 1.0 | Flow conservation (directed mode only) |
+| `--w-disc` | 0.0 | Discretization `Σx(1-x)`. Found ineffective — the congestion penalty pins `x` below 0.5, so this only shrinks weights (see `--disc-ramp-outer`) |
+| `--rho`, `--lr-x`, `--lr-lam` | 1.0 / 0.01 / 0.1 | AL penalty + step sizes |
+
+### Guide export (for Potter)
+
+| Script | Guide content | Use |
+|--------|---------------|-----|
+| **`scripts/gpu_guide_export.py`** | **Tight per-net shortest path** (~10 tiles/net) via GPU batched Bellman-Ford — all nets relaxed simultaneously | **both modes (recommended)** |
+| `scripts/export_potter_guidance.py --guide-out` | Same paths via per-net Dijkstra (CPU, multi-process). Reference implementation — far slower | validation |
+| `scripts/fast_guide_export.py` | Whole above-threshold corridor via GPU scatter. Fast but ~9× looser | experimental — see below |
+
+**Guide tightness is the guidance.** A loose corridor guide (~90 tiles/net) behaves like
+*no guide at all*: a soft A\* penalty spread over a large tile cloud does not steer the
+search, so Potter's runtime and CPWL match the unguided baseline. `fast_guide_export.py`
+saves export time and gives it straight back in detailed routing; it is kept only for
+experimentation (`--rel` tightens the corridor via a per-net relative threshold).
+
+`gpu_guide_export.py` gets tight paths *and* speed: every net's subgraph is a disjoint
+block of the flattened node array, so one `scatter_reduce(amin)` relaxes all nets at
+once (Bellman-Ford), then a vectorised backward walk reconstructs every path. Edge cost
+is `1/(x+eps)`, so paths follow the global route; nets with negligible flow still get a
+sensible path (no separate fallback needed).
+
+`export_potter_guidance.py --out` additionally writes per-connection **bboxes** (for
+Potter's `PartitionTree` scheduler), but that path is single-threaded per-net Dijkstra —
+slow on large designs; omit unless needed.
 
 Output layout:
 
@@ -124,15 +266,22 @@ python eval_circuits.py --testcases boom_med_pb boom_soc_v2
 | `src/router/flow_conservation.py` | Per-node Kirchhoff flow penalty |
 | `src/router/meng_lambda.py` | Meng normalized subgradient λ update |
 | `src/router/augmented_lagrangian.py` | AL optimizer |
-| `src/router/connectivity.py` | Effective resistance + CG |
-| `src/router/route_extractor.py` | Discrete tile paths |
+| `src/router/connectivity.py` | Effective resistance + batched CG (legacy; `--connectivity-solver cg`) |
+| `src/router/connectivity_grouped.py` | **Net-grouped subgraph CG** (`grouped`): super-sink RHS, warm-start, multi-GPU |
+| `src/router/route_extractor.py` | Discrete tile paths (parallel across cores) |
 | `src/detailed_route.py` | RapidWright PartialRouter |
 | `src/io/write_design.py` | Write `.phys`/`.dcp` |
 | `cpp/` | C++ Interchange RRG extractor (`extract_rrg`) |
 | `scripts/PrebuildNetIndex.py` | Offline net index cache (C++ stub nets + RRG bbox edges) |
 | `cpp/build/extract_net_index` | Potter-like stub net + INT tile bbox extraction from `.phys` |
 | `scripts/analyze_rrg_distances.py` | Validate RRG Manhattan distances |
+| `scripts/gpu_guide_export.py` | **Potter guide: GPU batched Bellman-Ford shortest paths (all nets at once)** |
+| `scripts/export_potter_guidance.py` | Potter guide: per-net Dijkstra paths + per-connection bboxes (CPU reference) |
+| `scripts/fast_guide_export.py` | Potter guide: per-net corridor via GPU scatter (loose; experimental) |
+| `scripts/run_all_benchmarks.sh` | End-to-end campaign over benchmarks, both modes → `campaign/results.csv` |
+| `scripts/eval_connectivity.py` | Fast quality metric: sink-pair connectivity + overflow (GPU label-prop) |
 | `docs/PAPER_ALIGNMENT.md` | Paper ↔ code mapping |
+| `docs/POTTER_INTEGRATION.md` | DiffRouter → Potter guidance: patch, modes, measurements |
 
 ## Testing
 

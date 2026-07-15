@@ -844,6 +844,83 @@ class GlobalRouter(nn.Module):
         solver: str = "cg",
         net_batch: int = 0,
     ) -> torch.Tensor:
+        return self._connectivity_grouped_or_loop(x, solver, eps, net_batch)
+
+    def _build_supersink_conn(self) -> Optional[dict]:
+        """B1: one connectivity column per net (source -> merged super-sink).
+
+        Column RHS = {source: +1, each sink: -1/k}. Collapses num_cols from ~5/net
+        to 1/net (~5x fewer CG columns/groups), still pulling the whole net toward
+        its sinks. Uses the grouped solver's general-RHS path.
+        """
+        if self._conn is None:
+            return None
+        dev = self.device
+        conn = self._conn
+        no = self._grouped_no
+        src = conn["src_flat"].long()
+        sink = conn["sink_flat"].long()
+        col_net = torch.searchsorted(no, src, right=True) - 1
+        _nets, counts = torch.unique_consecutive(col_net, return_counts=True)
+        num_super = int(_nets.numel())
+        offsets = torch.cumsum(counts, 0) - counts       # first orig col per net
+        src_super = src[offsets]                          # source node per super-col
+        super_col_of_orig = torch.repeat_interleave(
+            torch.arange(num_super, device=dev), counts)
+        sink_val = (-1.0 / counts.to(torch.float32))[super_col_of_orig]
+        rhs_node = torch.cat([src_super, sink])
+        rhs_col = torch.cat([torch.arange(num_super, device=dev), super_col_of_orig])
+        rhs_val = torch.cat([torch.ones(num_super, device=dev), sink_val])
+        order = torch.argsort(rhs_col, stable=True)
+        rhs_node, rhs_col, rhs_val = rhs_node[order], rhs_col[order], rhs_val[order]
+        rhs_off = torch.zeros(num_super + 1, dtype=torch.long, device=dev)
+        rhs_off[1:] = torch.cumsum(1 + counts, 0)
+        return {
+            "flat_u": conn["flat_u"], "flat_v": conn["flat_v"],
+            "src_flat": src_super, "sink_flat": src_super,  # sink_flat unused (general)
+            "col_id": torch.arange(num_super, device=dev),
+            "num_nodes": conn["num_nodes"], "num_cols": num_super,
+            "rhs_node": rhs_node, "rhs_col": rhs_col,
+            "rhs_val": rhs_val, "rhs_off": rhs_off,
+        }
+
+    def _grouped_conn(self) -> Optional[dict]:
+        """_conn, optionally super-sink (B1) or capping columns to conn_max_sinks."""
+        if self._conn is None:
+            return None
+        if getattr(self, "conn_super_sink", False):
+            if getattr(self, "_conn_super", None) is None:
+                self._conn_super = self._build_supersink_conn()
+            return self._conn_super
+        cap = int(getattr(self, "conn_max_sinks", 0) or 0)
+        if cap <= 0:
+            return self._conn
+        if getattr(self, "_conn_capped_k", None) == cap:
+            return self._conn_capped
+        dev = self.device
+        no = self._grouped_no
+        src = self._conn["src_flat"].long()
+        col_net = torch.searchsorted(no, src, right=True) - 1
+        net_ncol = torch.bincount(col_net, minlength=self.num_nets)
+        net_c_off = torch.zeros(self.num_nets + 1, dtype=torch.long, device=dev)
+        net_c_off[1:] = torch.cumsum(net_ncol, 0)
+        rank = torch.arange(src.numel(), device=dev) - net_c_off[col_net]
+        m = (rank < cap).nonzero(as_tuple=True)[0]
+        self._conn_capped = {
+            "flat_u": self._conn["flat_u"],
+            "flat_v": self._conn["flat_v"],
+            "src_flat": self._conn["src_flat"][m],
+            "sink_flat": self._conn["sink_flat"][m],
+            "col_id": torch.arange(m.numel(), device=dev),
+            "num_nodes": self._conn["num_nodes"],
+            "num_cols": int(m.numel()),
+        }
+        self._conn_capped_k = cap
+        return self._conn_capped
+
+    def _connectivity_grouped_or_loop(
+        self, x: torch.Tensor, solver: str, eps: float, net_batch: int
+    ) -> torch.Tensor:
         if solver == "grouped":
             from src.router.connectivity_grouped import effective_resistance_loss_grouped
             if getattr(self, "_grouped_vo", None) is None:
@@ -854,9 +931,10 @@ class GlobalRouter(nn.Module):
                 self._grouped_gcache = {}
                 # warm-start cache persists across AL iterations (enable via conn_warm_start)
                 self._grouped_ws = {} if getattr(self, "conn_warm_start", True) else None
+            conn = self._grouped_conn()
             return effective_resistance_loss_grouped(
                 x,
-                self._conn,
+                conn,
                 self._grouped_vo,
                 self._grouped_no,
                 eps=eps,
@@ -865,6 +943,7 @@ class GlobalRouter(nn.Module):
                 col_chunk=getattr(self, "conn_col_chunk", 128),
                 precond=getattr(self, "conn_precond", "none"),
                 ws_cache=self._grouped_ws,
+                _mg_devices=getattr(self, "conn_mg_devices", None),
                 _group_cache=self._grouped_gcache,
             )
 
@@ -950,14 +1029,18 @@ class GlobalRouter(nn.Module):
         flow_net_batch: int = 0,
     ) -> torch.Tensor:
         wl = self.wirelength_loss(x)
-        conn = self.connectivity_loss_effective_resistance(
-            x, solver=connectivity_solver, net_batch=conn_net_batch
-        )
         flow = self.flow_conservation_loss(x, net_batch=flow_net_batch)
         _, overflows = self._get_usage_and_overflows(x)
         penalty_linear = (lam * overflows).sum()
         penalty_quad = (rho / 2) * (overflows ** 2).sum()
-        total = w_wl * wl + w_conn * conn + w_flow * flow + penalty_linear + penalty_quad
+        total = w_wl * wl + w_flow * flow + penalty_linear + penalty_quad
+        # Skip the expensive connectivity CG entirely when its weight is 0 (A1/A2:
+        # connectivity-every-K-iters and freeze-after-convergence set w_conn=0).
+        if w_conn != 0.0:
+            conn = self.connectivity_loss_effective_resistance(
+                x, solver=connectivity_solver, net_batch=conn_net_batch
+            )
+            total = total + w_conn * conn
         if w_disc != 0.0:
             total = total + w_disc * self.discretization_loss(x)
         return total

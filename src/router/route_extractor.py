@@ -259,6 +259,49 @@ class RouteExtractor:
 
         return sequence
 
+    def extract_connection_bboxes(
+        self,
+        router,
+        x: torch.Tensor,
+        congestion_map: Optional[np.ndarray] = None,
+    ) -> Dict[int, List[Tuple[int, Tuple[int, int, int, int]]]]:
+        """Per-(net, sink) corridor bounding box, for Potter GR guidance.
+
+        For each net, returns a list of (sink_tile, (min_col, max_col, min_row,
+        max_row)) where the bbox spans the source->sink shortest path in the
+        thresholded graph -- much tighter than Potter's pin-centroid box when the
+        global route confines the connection.
+        """
+        x_cpu = x.detach().cpu()
+        out: Dict[int, List[Tuple[int, Tuple[int, int, int, int]]]] = {}
+        tiles = router.rrg.tiles
+        for net_idx in range(router.num_nets):
+            src = router.net_src_tile[net_idx]
+            sinks = router.net_sink_tiles[net_idx]
+            start, end = router._var_offset[net_idx], router._var_offset[net_idx + 1]
+            edge_list = router.net_edge_indices[net_idx]
+            if torch.is_tensor(edge_list):
+                edge_list = edge_list.tolist()
+            x_slice = x_cpu[start:end]
+            adj: Dict[int, List[Tuple[int, float, int]]] = {}
+            for k, edge_idx in enumerate(edge_list):
+                u, v = self._edge_endpoints(router, edge_idx)
+                w = float(x_slice[k].item())
+                if w < self.threshold:
+                    continue
+                adj.setdefault(u, []).append((v, w, edge_idx))
+                adj.setdefault(v, []).append((u, w, edge_idx))
+            conns: List[Tuple[int, Tuple[int, int, int, int]]] = []
+            for sink in sinks:
+                seg = self._shortest_path(router, adj, src, sink, congestion_map, net_idx)
+                if not seg:
+                    seg = [src, sink]
+                rows = [tiles[t][0] for t in seg]
+                cols = [tiles[t][1] for t in seg]
+                conns.append((sink, (min(cols), max(cols), min(rows), max(rows))))
+            out[net_idx] = conns
+        return out
+
     def paths_to_bbox(
         self,
         router,
@@ -311,6 +354,15 @@ def extract_paths_parallel(
     if workers == 1 or N == 0:
         return {i: ex.extract_one(router, x_cpu, i, congestion_map) for i in range(N)}
 
+    # Forked workers must not touch CUDA (fork after CUDA init is unsafe). Move the
+    # only per-net GPU tensors the workers read (edge lists) to CPU views first.
+    net_edges = router.net_edge_indices
+    if net_edges and torch.is_tensor(net_edges[0]) and net_edges[0].is_cuda:
+        fe = router._flat_edge_idx.cpu()
+        vo = router._var_offset
+        router.net_edge_indices = [fe[vo[i]:vo[i + 1]] for i in range(N)]
+        router._net_edge_tensors = router.net_edge_indices
+
     _MP_ROUTER, _MP_X, _MP_EX, _MP_CONG = router, x_cpu, ex, congestion_map
     nchunks = workers * 4
     step = (N + nchunks - 1) // nchunks
@@ -323,6 +375,9 @@ def extract_paths_parallel(
         with ctx.Pool(processes=workers) as pool:
             for part in pool.imap_unordered(_mp_extract_range, ranges):
                 paths.update(part)
+    except Exception as exc:  # noqa: BLE001 - fall back to serial on any pool failure
+        print(f"  [extract] parallel pool failed ({exc}); falling back to serial")
+        paths = {i: ex.extract_one(router, x_cpu, i, congestion_map) for i in range(N)}
     finally:
         torch.set_num_threads(prev_threads)
         _MP_ROUTER = _MP_X = _MP_EX = _MP_CONG = None

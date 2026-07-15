@@ -105,6 +105,58 @@ def _cg_block(w, flat_u, flat_v, B, eps, max_iter, tol, num_nodes,
     return X
 
 
+def _grouped_core(wd, flat_u, flat_v, src_flat, sink_flat, col_id,
+                  rhs_node, rhs_col, rhs_val,
+                  vo, no, co, ro, gs, ge, g_lo, g_hi,
+                  eps, cg_max_iter, cg_tol, precond, ws_cache):
+    """Process groups [g_lo, g_hi) on one device. Returns (loss, grad_w).
+
+    All tensors already on the target device; vo/no/co/ro/gs/ge are CPU lists.
+    grad_w is full-length but nonzero only in the processed groups' edges (groups
+    are edge-disjoint, so per-device grad_w sum cleanly for B2 multi-GPU).
+    """
+    device, dtype = wd.device, wd.dtype
+    grad_w = torch.zeros_like(wd)
+    loss = torch.zeros((), device=device, dtype=dtype)
+    general = ro is not None
+    for g in range(g_lo, g_hi):
+        a, b = gs[g], ge[g]
+        e0, e1 = vo[a], vo[b]
+        n0, n1 = no[a], no[b]
+        c0, c1 = co[a], co[b]
+        if e1 == e0 or c1 == c0:
+            continue
+        fu = flat_u[e0:e1].long() - n0
+        fv = flat_v[e0:e1].long() - n0
+        wg = wd[e0:e1]
+        ncols = c1 - c0
+        nn = n1 - n0
+        B = torch.zeros(nn, ncols, device=device, dtype=dtype)
+        if general:
+            r0, r1 = ro[c0], ro[c1]
+            rn = rhs_node[r0:r1].long() - n0
+            rc = rhs_col[r0:r1].long() - c0
+            B.index_put_((rn, rc), rhs_val[r0:r1].to(dtype), accumulate=True)
+        else:
+            cols = (col_id[c0:c1].long() - c0)
+            sv = src_flat[c0:c1].long() - n0
+            kv = sink_flat[c0:c1].long() - n0
+            ones = torch.ones(ncols, device=device, dtype=dtype)
+            B.index_put_((sv, cols), ones, accumulate=True)
+            B.index_put_((kv, cols), -ones, accumulate=True)
+        X0 = ws_cache.get(g) if ws_cache is not None else None
+        Z = _cg_block(wg, fu, fv, B, eps, cg_max_iter, cg_tol, nn,
+                      precond=precond, X0=X0)
+        if ws_cache is not None:
+            ws_cache[g] = Z.detach()
+        loss = loss + (B * Z).sum()
+        zu = Z.index_select(0, fu)
+        zv = Z.index_select(0, fv)
+        grad_w[e0:e1] -= (zu - zv).square().sum(dim=1)
+        del B, Z
+    return loss, grad_w
+
+
 class GroupedEffectiveResistance(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -118,54 +170,25 @@ class GroupedEffectiveResistance(torch.autograd.Function):
         max_groups,   # profiling: process only this many groups (0 = all)
         precond,      # "none" | "jacobi"
         ws_cache,     # None, or dict{group_idx -> Z} for warm-start across calls
+        rhs_node, rhs_col, rhs_val, rhs_off,  # B1 super-sink: general RHS (or None)
     ):
-        device, dtype = w.device, w.dtype
         wd = w.detach()
-        grad_w = torch.zeros_like(wd)
-        loss = torch.zeros((), device=device, dtype=dtype)
         ng = int(g_start.numel())
         limit = ng if max_groups <= 0 else min(ng, max_groups)
-        vo = var_offset.tolist()
-        no = node_offset.tolist()
-        co = net_c_off.tolist()
-        gs = g_start.tolist()
-        ge = g_end.tolist()
-        for g in range(limit):
-            a, b = gs[g], ge[g]
-            e0, e1 = vo[a], vo[b]
-            n0, n1 = no[a], no[b]
-            c0, c1 = co[a], co[b]
-            if e1 == e0 or c1 == c0:
-                continue
-            fu = flat_u[e0:e1].long() - n0
-            fv = flat_v[e0:e1].long() - n0
-            wg = wd[e0:e1]
-            ncols = c1 - c0
-            nn = n1 - n0
-            cols = (col_id[c0:c1].long() - c0)
-            sv = src_flat[c0:c1].long() - n0
-            kv = sink_flat[c0:c1].long() - n0
-            ones = torch.ones(ncols, device=device, dtype=dtype)
-            B = torch.zeros(nn, ncols, device=device, dtype=dtype)
-            B.index_put_((sv, cols), ones, accumulate=True)
-            B.index_put_((kv, cols), -ones, accumulate=True)
-            X0 = ws_cache.get(g) if ws_cache is not None else None
-            Z = _cg_block(wg, fu, fv, B, eps, cg_max_iter, cg_tol, nn,
-                          precond=precond, X0=X0)
-            if ws_cache is not None:
-                ws_cache[g] = Z.detach()
-            loss = loss + (B * Z).sum()
-            zu = Z.index_select(0, fu)
-            zv = Z.index_select(0, fv)
-            grad_w[e0:e1] -= (zu - zv).square().sum(dim=1)
-            del B, Z
+        ro = rhs_off.tolist() if rhs_off is not None else None
+        loss, grad_w = _grouped_core(
+            wd, flat_u, flat_v, src_flat, sink_flat, col_id,
+            rhs_node, rhs_col, rhs_val,
+            var_offset.tolist(), node_offset.tolist(), net_c_off.tolist(),
+            ro, g_start.tolist(), g_end.tolist(), 0, limit,
+            eps, cg_max_iter, cg_tol, precond, ws_cache)
         ctx.save_for_backward(grad_w)
         return loss
 
     @staticmethod
     def backward(ctx, grad_out):
         (grad_w,) = ctx.saved_tensors
-        return (grad_out * grad_w,) + (None,) * 17
+        return (grad_out * grad_w,) + (None,) * 21
 
 
 def effective_resistance_loss_grouped(
@@ -181,6 +204,7 @@ def effective_resistance_loss_grouped(
     max_groups: int = 0,
     precond: str = "none",
     ws_cache: Optional[dict] = None,
+    _mg_devices=None,
     _group_cache: Optional[dict] = None,
 ) -> torch.Tensor:
     """Net-grouped effective-resistance loss. Same result as the batched impl.
@@ -218,10 +242,94 @@ def effective_resistance_loss_grouped(
             _group_cache["g_end"] = g_end
             _group_cache["num_groups"] = int(g_start.numel())
 
+    if ws_cache is not None and _mg_devices is not None and len(_mg_devices) > 1:
+        return _grouped_multigpu(
+            w, conn, var_offset, node_offset, net_c_off, g_start, g_end,
+            eps, cg_max_iter, cg_tol, precond, ws_cache, _mg_devices, _group_cache)
     return GroupedEffectiveResistance.apply(
         w, conn["flat_u"], conn["flat_v"], src_flat,
         conn["sink_flat"], conn["col_id"],
         var_offset, node_offset, net_c_off,
         g_start, g_end,
         eps, cg_max_iter, cg_tol, max_groups, precond, ws_cache,
+        conn.get("rhs_node"), conn.get("rhs_col"),
+        conn.get("rhs_val"), conn.get("rhs_off"),
     )
+
+
+class _GroupedMultiGPU(torch.autograd.Function):
+    """B2: shard groups across GPUs, run in threads, gather. Implicit-diff grad_w
+    slices are edge-disjoint across groups, so per-device grads sum on the main
+    device. Static arrays are replicated per device (cached); w is moved each call."""
+
+    @staticmethod
+    def forward(ctx, w, replicas, cpu_lists, ranges, devices,
+                eps, cg_max_iter, cg_tol, precond, ws_caches):
+        import threading
+        wd = w.detach()
+        main = w.device
+        vo, no, co, ro, gs, ge = cpu_lists
+        results = [None] * len(devices)
+
+        def work(i):
+            dev = devices[i]
+            r = replicas[i]
+            w_d = wd if dev == main else wd.to(dev)
+            lo, hi = ranges[i]
+            loss_d, grad_d = _grouped_core(
+                w_d, r["flat_u"], r["flat_v"], r["src_flat"], r["sink_flat"],
+                r["col_id"], r["rhs_node"], r["rhs_col"], r["rhs_val"],
+                vo, no, co, ro, gs, ge, lo, hi,
+                eps, cg_max_iter, cg_tol, precond, ws_caches[i])
+            results[i] = (loss_d.to(main), grad_d.to(main))
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(len(devices))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        loss = sum(r[0] for r in results)
+        grad_w = sum(r[1] for r in results)
+        ctx.save_for_backward(grad_w)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (grad_w,) = ctx.saved_tensors
+        return (grad_out * grad_w,) + (None,) * 9
+
+
+def _grouped_multigpu(w, conn, var_offset, node_offset, net_c_off, g_start, g_end,
+                      eps, cg_max_iter, cg_tol, precond, ws_cache, devices, gcache):
+    """Set up (cached) per-device replicas + group partition, then run _GroupedMultiGPU."""
+    ng = int(g_start.numel())
+    if gcache is None or "mg_replicas" not in gcache:
+        replicas = []
+        keys = ["flat_u", "flat_v", "src_flat", "sink_flat", "col_id",
+                "rhs_node", "rhs_col", "rhs_val"]
+        for d in devices:
+            rep = {}
+            for k in keys:
+                v = conn.get(k)
+                rep[k] = None if v is None else v.to(d)
+            replicas.append(rep)
+        # partition groups into contiguous, ~equal chunks by group index
+        step = (ng + len(devices) - 1) // len(devices)
+        ranges = [(i, min(i + step, ng)) for i in range(0, ng, step)]
+        while len(ranges) < len(devices):
+            ranges.append((ng, ng))
+        ws_caches = ws_cache.setdefault("_mg", [dict() for _ in devices]) \
+            if isinstance(ws_cache, dict) else [dict() for _ in devices]
+        if gcache is not None:
+            gcache["mg_replicas"] = replicas
+            gcache["mg_ranges"] = ranges
+            gcache["mg_ws"] = ws_caches
+    replicas = gcache["mg_replicas"]
+    ranges = gcache["mg_ranges"]
+    ws_caches = gcache["mg_ws"]
+    cpu_lists = (var_offset.tolist(), node_offset.tolist(), net_c_off.tolist(),
+                 conn["rhs_off"].tolist() if conn.get("rhs_off") is not None else None,
+                 g_start.tolist(), g_end.tolist())
+    return _GroupedMultiGPU.apply(
+        w, replicas, cpu_lists, ranges, devices,
+        eps, cg_max_iter, cg_tol, precond, ws_caches)

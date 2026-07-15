@@ -28,6 +28,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--x", required=True)
     ap.add_argument("--rrg", default="data/rrg_xcvu3p_int.pt")
+    ap.add_argument("--testcase", default="boom_soc_v2")
     ap.add_argument("--threshold", type=float, default=0.01)
     ap.add_argument("--workers", type=int, default=64)
     ap.add_argument("--save-paths", default="")
@@ -37,7 +38,7 @@ def main():
     from src.router.net_index import default_net_index_path
     from src.router.route_extractor import RouteExtractor
 
-    ni = default_net_index_path("./data/", "boom_soc_v2", args.rrg, "directed", 0, 0.1,
+    ni = default_net_index_path("./data/", args.testcase, args.rrg, "directed", 0, 0.1,
                                 route_filter="stubs", edge_scope="corridor",
                                 corridor_width=2, max_edges_per_net=50000)
     t = time.time()
