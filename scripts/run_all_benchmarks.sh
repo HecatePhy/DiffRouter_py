@@ -68,6 +68,14 @@ secs() { # extract "Elapsed (wall clock)" m:ss / h:mm:ss -> seconds
   echo "$t" | awk -F: '{s=0; for(i=1;i<=NF;i++) s=s*60+$i; printf "%.0f", s}'
 }
 cpwl() { grep -iE "^Wirelength:" "$1" 2>/dev/null | head -1 | grep -oE "[0-9]+"; }
+upsert() { # <csv line> -- replace any existing row for the same benchmark,mode
+  local line="$1" key
+  key=$(echo "$line" | cut -d, -f1,2)
+  local tmp; tmp=$(mktemp)
+  grep -v "^$key," "$CSV" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$CSV"
+  echo "$line" >> "$CSV"
+}
 
 run_mode() { # benchmark mode
   local b=$1 mode=$2
@@ -90,7 +98,7 @@ run_mode() { # benchmark mode
   fi
   t_g=$(secs "$gl")
   if [ ! -f "$res/$b/checkpoint/global_x.pt" ]; then
-    echo "$b,$mode,,,,,,,GLOBAL_FAILED" >> "$CSV"; log "$b/$mode: global FAILED (see $gl)"; return 1
+    upsert "$b,$mode,,,,,,,GLOBAL_FAILED"; log "$b/$mode: global FAILED (see $gl)"; return 1
   fi
 
   # ---- 2. guide: written INLINE by the global-route step above (GPU batched
@@ -105,7 +113,7 @@ run_mode() { # benchmark mode
   else
     t_e=0   # produced inline by the global-route stage
   fi
-  [ -f "$guide" ] || { echo "$b,$mode,$t_g,,,,,,GUIDE_FAILED" >> "$CSV"; log "$b/$mode: guide FAILED"; return 1; }
+  [ -f "$guide" ] || { upsert "$b,$mode,$t_g,,,,,,GUIDE_FAILED"; log "$b/$mode: guide FAILED"; return 1; }
 
   # ---- 3. Potter (guided). isolated: one route at a time
   local pen=2; [ "$mode" = "runtime" ] && pen=0.5
@@ -116,14 +124,18 @@ run_mode() { # benchmark mode
         -t "$THREADS" -r -g "$guide" --guide_penalty $pen > "$pl" 2>&1
   fi
   t_p=$(secs "$pl")
-  [ -f "$outphys" ] || { echo "$b,$mode,$t_g,$t_e,,,,,POTTER_FAILED" >> "$CSV"; log "$b/$mode: Potter FAILED"; return 1; }
+  [ -f "$outphys" ] || { upsert "$b,$mode,$t_g,$t_e,,,,,POTTER_FAILED"; log "$b/$mode: Potter FAILED"; return 1; }
 
   # ---- 4. CPWL
   local wl="$OUT/logs/$b.$mode.wa.log"
   [ -f "$wl" ] || (cd "$POTTER/wirelength_analyzer" && python -u wa.py "$outphys" > "$wl" 2>&1)
   local nets; nets=$(grep -oE "[0-9]+ nets matched" "$pl" | head -1 | grep -oE "^[0-9]+")
+  # A blank stage time means that stage was reused from a previous run, so the total
+  # would understate the real cost -- flag it rather than report a misleading number.
+  local note="ok"
+  [ -z "${t_g:-}" ] || [ -z "${t_p:-}" ] && note="ok(partial:cached-stage)"
   local total=$(( ${t_g:-0} + ${t_e:-0} + ${t_p:-0} ))
-  echo "$b,$mode,${t_g:-},${t_e:-},${t_p:-},$total,$(cpwl "$wl"),${nets:-},ok" >> "$CSV"
+  upsert "$b,$mode,${t_g:-},${t_e:-},${t_p:-},$total,$(cpwl "$wl"),${nets:-},$note"
   log "$b/$mode: total=${total}s cpwl=$(cpwl "$wl")"
 }
 
@@ -138,7 +150,7 @@ for b in $BENCH; do
     python -u scripts/PrebuildNetIndex.py --testcase "$b" --rrg "$RRG" \
         --edge-mode directed --edge-scope corridor --corridor-width 2 \
         > "$OUT/logs/$b.netindex.log" 2>&1 \
-      || { log "$b: net index FAILED"; echo "$b,,,,,,,,NETINDEX_FAILED" >> "$CSV"; continue; }
+      || { log "$b: net index FAILED"; upsert "$b,,,,,,,,NETINDEX_FAILED"; continue; }
   fi
 
   # ---- unguided Potter reference (once per benchmark)
@@ -150,7 +162,7 @@ for b in $BENCH; do
     uw="$OUT/logs/$b.unguided.wa.log"
     [ -f "$OUT/$b/${b}.unguided.routed.phys" ] && \
       (cd "$POTTER/wirelength_analyzer" && python -u wa.py "$OUT/$b/${b}.unguided.routed.phys" > "$uw" 2>&1)
-    tp=$(secs "$ul"); echo "$b,unguided,0,0,${tp:-},${tp:-},$(cpwl "$uw"),,ok" >> "$CSV"
+    tp=$(secs "$ul"); upsert "$b,unguided,0,0,${tp:-},${tp:-},$(cpwl "$uw"),,ok"
     log "$b/unguided: total=${tp}s cpwl=$(cpwl "$uw")"
   fi
 
