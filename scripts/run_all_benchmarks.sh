@@ -20,7 +20,7 @@ cd "$ROOT"
 CONDA_ENV="${CONDA_ENV:-diffrouter}"
 if [ -z "${CONDA_SH:-}" ]; then
   for c in "$HOME/miniforge3" "$(dirname "$(dirname "$(command -v conda 2>/dev/null || echo /nonexistent)")")" \
-           /home/usr1/"$USER"/miniforge3 "$HOME/miniconda3" "$HOME/anaconda3"; do
+           "$HOME/miniconda3" "$HOME/anaconda3"; do
     [ -f "$c/etc/profile.d/conda.sh" ] && { CONDA_SH="$c/etc/profile.d/conda.sh"; break; }
   done
 fi
@@ -31,7 +31,7 @@ fi
 python -c "import torch" 2>/dev/null || {
   echo "ERROR: no torch in '$(command -v python)'. Set CONDA_SH=/path/to/conda.sh CONDA_ENV=<env>."; exit 1; }
 
-POTTER="${POTTER:-/tmp/claude-5033/-home-usr1-xg3787-projs-DiffRouter-py/4dd12ae8-e3ff-4789-826a-5238420035fd/scratchpad/Potter}"
+POTTER="${POTTER:-$ROOT/third_party/Potter}"   # built by potter/setup_potter.sh
 OUT="${OUT:-$ROOT/campaign}"
 THREADS="${THREADS:-32}"
 ITERS="${ITERS:-60}"
@@ -40,6 +40,13 @@ MODES="${MODES:-both}"
 RRG="${RRG:-data/rrg_xcvu3p_int.pt}"
 DEV="${DEV:-data/xcvu3p.device}"
 SKIP_UNGUIDED="${SKIP_UNGUIDED:-0}"
+
+if [ ! -x "$POTTER/build/route" ]; then
+  echo "ERROR: no Potter binary at $POTTER/build/route"
+  echo "       run potter/setup_potter.sh first, or set POTTER=/path/to/Potter"
+  exit 1
+fi
+if [ ! -f "$DEV" ]; then echo "ERROR: device file not found: $DEV"; exit 1; fi
 EARLY_STOP_TOL="${EARLY_STOP_TOL:-0.01}"   # adapt iters per design (0 disables)
 
 # default: every benchmark that has an unrouted .phys, smallest first (fail fast)
@@ -61,6 +68,14 @@ secs() { # extract "Elapsed (wall clock)" m:ss / h:mm:ss -> seconds
   echo "$t" | awk -F: '{s=0; for(i=1;i<=NF;i++) s=s*60+$i; printf "%.0f", s}'
 }
 cpwl() { grep -iE "^Wirelength:" "$1" 2>/dev/null | head -1 | grep -oE "[0-9]+"; }
+upsert() { # <csv line> -- replace any existing row for the same benchmark,mode
+  local line="$1" key
+  key=$(echo "$line" | cut -d, -f1,2)
+  local tmp; tmp=$(mktemp)
+  grep -v "^$key," "$CSV" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$CSV"
+  echo "$line" >> "$CSV"
+}
 
 run_mode() { # benchmark mode
   local b=$1 mode=$2
@@ -73,17 +88,20 @@ run_mode() { # benchmark mode
   # ---- 1. global route
   if [ ! -f "$res/$b/checkpoint/global_x.pt" ]; then
     log "$b/$mode: global route"
+    # Keep these in lockstep with the README's flow-mode commands: the campaign must
+    # measure exactly the configuration we document.
     local extra="--conn-every 5"
     [ "$mode" = "runtime" ] && extra="--conn-every 5 --conn-super-sink --conn-multi-gpu $NGPU"
     /usr/bin/time -v python -u run_exp.py --testcase "$b" --global-only \
-        --rrg "$RRG" --connectivity-solver grouped --conn-warm-start $extra \
+        --rrg "$RRG" --connectivity-solver grouped --conn-warm-start \
+        --conn-col-chunk 128 --conn-cg-max-iter 8 $extra \
         --max-iterations "$ITERS" --num-inner 5 --skip-extract \
         --early-stop-tol "$EARLY_STOP_TOL" \
         --guide-out "$guide" --results "$res/" > "$gl" 2>&1
   fi
   t_g=$(secs "$gl")
   if [ ! -f "$res/$b/checkpoint/global_x.pt" ]; then
-    echo "$b,$mode,,,,,,,GLOBAL_FAILED" >> "$CSV"; log "$b/$mode: global FAILED (see $gl)"; return 1
+    upsert "$b,$mode,,,,,,,GLOBAL_FAILED"; log "$b/$mode: global FAILED (see $gl)"; return 1
   fi
 
   # ---- 2. guide: written INLINE by the global-route step above (GPU batched
@@ -98,7 +116,7 @@ run_mode() { # benchmark mode
   else
     t_e=0   # produced inline by the global-route stage
   fi
-  [ -f "$guide" ] || { echo "$b,$mode,$t_g,,,,,,GUIDE_FAILED" >> "$CSV"; log "$b/$mode: guide FAILED"; return 1; }
+  [ -f "$guide" ] || { upsert "$b,$mode,$t_g,,,,,,GUIDE_FAILED"; log "$b/$mode: guide FAILED"; return 1; }
 
   # ---- 3. Potter (guided). isolated: one route at a time
   local pen=2; [ "$mode" = "runtime" ] && pen=0.5
@@ -109,14 +127,18 @@ run_mode() { # benchmark mode
         -t "$THREADS" -r -g "$guide" --guide_penalty $pen > "$pl" 2>&1
   fi
   t_p=$(secs "$pl")
-  [ -f "$outphys" ] || { echo "$b,$mode,$t_g,$t_e,,,,,POTTER_FAILED" >> "$CSV"; log "$b/$mode: Potter FAILED"; return 1; }
+  [ -f "$outphys" ] || { upsert "$b,$mode,$t_g,$t_e,,,,,POTTER_FAILED"; log "$b/$mode: Potter FAILED"; return 1; }
 
   # ---- 4. CPWL
   local wl="$OUT/logs/$b.$mode.wa.log"
   [ -f "$wl" ] || (cd "$POTTER/wirelength_analyzer" && python -u wa.py "$outphys" > "$wl" 2>&1)
   local nets; nets=$(grep -oE "[0-9]+ nets matched" "$pl" | head -1 | grep -oE "^[0-9]+")
+  # A blank stage time means that stage was reused from a previous run, so the total
+  # would understate the real cost -- flag it rather than report a misleading number.
+  local note="ok"
+  [ -z "${t_g:-}" ] || [ -z "${t_p:-}" ] && note="ok(partial:cached-stage)"
   local total=$(( ${t_g:-0} + ${t_e:-0} + ${t_p:-0} ))
-  echo "$b,$mode,${t_g:-},${t_e:-},${t_p:-},$total,$(cpwl "$wl"),${nets:-},ok" >> "$CSV"
+  upsert "$b,$mode,${t_g:-},${t_e:-},${t_p:-},$total,$(cpwl "$wl"),${nets:-},$note"
   log "$b/$mode: total=${total}s cpwl=$(cpwl "$wl")"
 }
 
@@ -131,7 +153,7 @@ for b in $BENCH; do
     python -u scripts/PrebuildNetIndex.py --testcase "$b" --rrg "$RRG" \
         --edge-mode directed --edge-scope corridor --corridor-width 2 \
         > "$OUT/logs/$b.netindex.log" 2>&1 \
-      || { log "$b: net index FAILED"; echo "$b,,,,,,,,NETINDEX_FAILED" >> "$CSV"; continue; }
+      || { log "$b: net index FAILED"; upsert "$b,,,,,,,,NETINDEX_FAILED"; continue; }
   fi
 
   # ---- unguided Potter reference (once per benchmark)
@@ -143,7 +165,7 @@ for b in $BENCH; do
     uw="$OUT/logs/$b.unguided.wa.log"
     [ -f "$OUT/$b/${b}.unguided.routed.phys" ] && \
       (cd "$POTTER/wirelength_analyzer" && python -u wa.py "$OUT/$b/${b}.unguided.routed.phys" > "$uw" 2>&1)
-    tp=$(secs "$ul"); echo "$b,unguided,0,0,${tp:-},${tp:-},$(cpwl "$uw"),,ok" >> "$CSV"
+    tp=$(secs "$ul"); upsert "$b,unguided,0,0,${tp:-},${tp:-},$(cpwl "$uw"),,ok"
     log "$b/unguided: total=${tp}s cpwl=$(cpwl "$uw")"
   fi
 

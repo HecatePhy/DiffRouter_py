@@ -35,7 +35,7 @@ def optimize_augmented_lagrangian(
     early_stop_tol: float = 0.0,
     early_stop_patience: int = 3,
     connectivity: str = "effective_resistance",
-    connectivity_solver: str = "cg",
+    connectivity_solver: str = "grouped",
     conn_net_batch: int = 0,
     flow_net_batch: int = 0,
     verbose: bool = True,

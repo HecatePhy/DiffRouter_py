@@ -24,8 +24,9 @@ ln -sf "$PWD/data/xcvu3p.device" third_party/Potter/xcvu3p.device
 
 This produces `third_party/Potter/build/route`. Needs cmake, a C++17 compiler, zlib and
 boost-serialization (Cap'n Proto is bundled with Potter). The patch itself is
-`potter/0001-diffrouter-gr-guidance.patch`; see [`docs/POTTER_INTEGRATION.md`](docs/POTTER_INTEGRATION.md)
-for what it changes and why.
+`potter/0001-diffrouter-gr-guidance.patch` — it adds the `-g/--guide` and
+`--guide_penalty` options, a soft out-of-guide term in the A* node cost, and net-name
+capture so guides can be matched to nets.
 
 ### The two modes
 
@@ -46,7 +47,8 @@ Max-connectivity global route → tight Dijkstra path guide → strong guide pen
 ```bash
 # 1. global route + guide (guide is written inline from the in-memory router)
 python run_exp.py --testcase boom_soc_v2 --global-only \
-    --connectivity-solver grouped --conn-warm-start --conn-every 5 \
+    --connectivity-solver grouped --conn-warm-start \
+    --conn-col-chunk 128 --conn-cg-max-iter 8 --conn-every 5 \
     --max-iterations 60 --num-inner 5 \
     --guide-out bsv2.guide --skip-extract
 
@@ -64,6 +66,7 @@ Fastest global route → same tight Dijkstra guide → gentle penalty.
 # 1. global route + guide: conn-every + super-sink + multi-GPU
 python run_exp.py --testcase boom_soc_v2 --global-only \
     --connectivity-solver grouped --conn-warm-start \
+    --conn-col-chunk 128 --conn-cg-max-iter 8 \
     --conn-every 5 --conn-super-sink --conn-multi-gpu 4 \
     --max-iterations 60 --num-inner 5 \
     --guide-out bsv2.guide --skip-extract
@@ -91,7 +94,6 @@ It is the main dial between the two modes:
 | ~1 | trade-off |
 | ~2+ | strong adherence — best wirelength, slower routing (routes forced into corridors) |
 
-Potter integration (patch + build): see [`docs/POTTER_INTEGRATION.md`](docs/POTTER_INTEGRATION.md).
 
 ---
 
@@ -302,7 +304,6 @@ python eval_circuits.py --testcases boom_med_pb boom_soc_v2
 | `potter/0001-diffrouter-gr-guidance.patch` | The Potter-side patch (`-g/--guide`, `--guide_penalty`, soft guide cost in A*) |
 | `scripts/eval_connectivity.py` | Fast quality metric: sink-pair connectivity + overflow (GPU label-prop) |
 | `docs/PAPER_ALIGNMENT.md` | Paper ↔ code mapping |
-| `docs/POTTER_INTEGRATION.md` | DiffRouter → Potter guidance: patch, modes, measurements |
 
 ## Testing
 

@@ -66,7 +66,7 @@ def _load_router(args, device):
             )
         router.conn_col_chunk = getattr(args, "conn_col_chunk", 32)
         router.conn_cg_max_iter = getattr(args, "conn_cg_max_iter", 100)
-        router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 0)
+        router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 8_000_000)
         router.conn_warm_start = getattr(args, "conn_warm_start", True)
         router.conn_max_sinks = getattr(args, "conn_max_sinks", 0)
         router.conn_super_sink = getattr(args, "conn_super_sink", False)
@@ -87,7 +87,7 @@ def _load_router(args, device):
         )
     router.conn_col_chunk = getattr(args, "conn_col_chunk", 32)
     router.conn_cg_max_iter = getattr(args, "conn_cg_max_iter", 100)
-    router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 0)
+    router.conn_edge_chunk = getattr(args, "conn_edge_chunk", 8_000_000)
     router.conn_warm_start = getattr(args, "conn_warm_start", True)
     router.conn_max_sinks = getattr(args, "conn_max_sinks", 0)
     router.conn_super_sink = getattr(args, "conn_super_sink", False)
@@ -295,20 +295,30 @@ def main():
                              "router, so no reload round-trip)")
     parser.add_argument("--skip-extract", action="store_true",
                         help="Skip tile-path extraction (not needed when using --guide-out)")
-    parser.add_argument("--connectivity-solver", choices=["solve", "cg", "grouped"], default="cg",
-                        help="grouped = net-grouped subgraph CG (fast + low memory at scale)")
+    parser.add_argument("--connectivity-solver", choices=["solve", "cg", "grouped"], default="grouped",
+                        help="grouped = net-grouped subgraph CG: each chunk solves only its "
+                             "nets' subgraph. Default -- far faster and lower-memory at scale. "
+                             "'cg' (batched, whole-graph matvec per chunk) and 'solve' (dense "
+                             "per-net) are kept for reference and OOM on large designs unless "
+                             "--conn-edge-chunk is set.")
     parser.add_argument("--conn-warm-start", action="store_true", default=True,
                         help="grouped solver: warm-start CG from previous iter's solution")
     parser.add_argument("--no-conn-warm-start", dest="conn_warm_start", action="store_false")
     parser.add_argument("--conn-net-batch", type=int, default=0,
                         help="Legacy: per-net solve subsample (ignored when solver=cg)")
-    parser.add_argument("--conn-edge-chunk", type=int, default=0,
-                        help="Bound connectivity Laplacian matvec temporary to "
-                             "[edge_chunk, col_chunk] rows; 0 = no chunking. "
-                             "Set ~8000000 for large designs to avoid OOM.")
-    parser.add_argument("--conn-col-chunk", type=int, default=32,
-                        help="Sink columns per CG chunk (lower = less GPU memory)")
-    parser.add_argument("--conn-cg-max-iter", type=int, default=100)
+    parser.add_argument("--conn-edge-chunk", type=int, default=8_000_000,
+                        help="solver=cg only: bound the Laplacian matvec temporary to "
+                             "[edge_chunk, col_chunk] rows (0 = unbounded). The unbounded "
+                             "temporary is num_vars x col_chunk, which is tens of GB on large "
+                             "designs and OOMs; chunking is exact, just accumulated in slices.")
+    parser.add_argument("--conn-col-chunk", type=int, default=128,
+                        help="Sink columns per CG chunk. Larger amortizes kernel-launch "
+                             "overhead (the grouped solver is launch-bound); lower = less "
+                             "GPU memory.")
+    parser.add_argument("--conn-cg-max-iter", type=int, default=8,
+                        help="CG iterations per connectivity solve. 8 suffices with "
+                             "--conn-warm-start (each solve starts from the previous "
+                             "iteration's solution). Raise if you disable warm-start.")
     parser.add_argument("--conn-max-sinks", type=int, default=0,
                         help="Cap connectivity to first K sinks/net (0=all). Cheap runtime "
                              "lever: huge-fanout nets dominate connectivity cost.")
