@@ -139,9 +139,13 @@ for b in $BENCH; do
     warned_capnp=1
   fi
   nn=$(grep -oE "[0-9]+ nets matched" "$OUT/logs/$b.eg.potter.log" 2>/dev/null | head -1 | grep -oE "^[0-9]+")
-  # EG global-route seconds: run_exp's [optimize] X.Ys timer (fallback to /usr/bin/time).
-  gs=$(grep -oE "\[optimize\] [0-9.]+s" "$OUT/logs/$b.eg.log" 2>/dev/null | tail -1 | grep -oE "[0-9.]+" | cut -d. -f1)
-  [ -z "$gs" ] && gs=$(secs "$OUT/logs/$b.eg.log")
+  # guide_s = global route + guide export, i.e. the whole pre-Potter flow: run_exp's
+  # top-level [optimize] and [guide] timer lines (the ^ anchor skips the indented
+  # per-stage [guide] prints). Does NOT include the offline wa.py/total_wirelength.py.
+  opt=$(grep -oE "^\[optimize\] [0-9.]+s" "$OUT/logs/$b.eg.log" 2>/dev/null | tail -1 | grep -oE "[0-9.]+")
+  gexp=$(grep -oE "^\[guide\] [0-9.]+s" "$OUT/logs/$b.eg.log" 2>/dev/null | tail -1 | grep -oE "[0-9.]+")
+  if [ -n "$opt" ]; then gs=$(awk "BEGIN{printf \"%.0f\", $opt + ${gexp:-0}}")
+  else gs=$(secs "$OUT/logs/$b.eg.log"); fi
   ps=$(secs "$OUT/logs/$b.eg.potter.log")
   echo "$b,eg,${nn:-},${gs:-},${ps:-},${cp:-},${tt:-}" >> "$CSV"
   log "$b/eg: guide_s=${gs:-?} potter_s=${ps:-?} cpwl=${cp:-?} total_wl=${tt:-?}"
