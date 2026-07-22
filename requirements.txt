@@ -1,12 +1,22 @@
-# DiffRouter-py: Differentiable Global Router for FPGA
-# Python 3.8+
+# DiffRouter Python dependencies.
+# Reproduced with: Python 3.9, CUDA 12.x. Install: pip install -r requirements.txt
+#
+# Core — global routing + guide export (run_exp.py, scripts/crossing_metric.py,
+# scripts/total_wirelength.py). torch must match your CUDA toolkit; the pinned build
+# below was torch 2.8.0+cu128. For a different CUDA version install the matching torch
+# wheel from https://pytorch.org first, then the rest.
+torch>=2.0
+numpy>=1.24
 
-torch>=2.0.0
-numpy>=1.20.0
-matplotlib>=3.5.0
-Pillow>=9.0.0
-pytest>=8.0.0
+# Visualization — congestion maps in scripts/congestion_diag.py (optional; the script
+# runs and prints numbers without it, only the PNG is skipped).
+matplotlib>=3.5
 
-# RapidWright: FPGA design/device API (--from-device, ExtractRRG, load_design)
-# Requires Java 8+
-rapidwright>=2024.1.0
+# --- Not pip-installed here; required only for specific offline steps ---
+# rapidwright        RRG extraction / device parsing (RRG *build* only, not routing).
+#                    Java-backed; install per https://www.rapidwright.io/ if rebuilding
+#                    data/rrg_*.pt from a device.
+# fpga-interchange   Used by Potter's wirelength_analyzer/wa.py and by
+#                    scripts/total_wirelength.py to parse .phys files. It ships with
+#                    Potter (see potter/setup_potter.sh); no separate install needed
+#                    when POTTER points at a built Potter checkout.

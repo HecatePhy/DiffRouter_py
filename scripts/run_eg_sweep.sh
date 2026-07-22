@@ -18,12 +18,23 @@ set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-CONDA_SH="${CONDA_SH:-/home/usr1/xg3787/miniforge3/etc/profile.d/conda.sh}"
-[ -f "$CONDA_SH" ] && { . "$CONDA_SH"; conda activate "${CONDA_ENV:-diffrouter}"; }
-PY=$(which python)
-$PY -c "import torch" 2>/dev/null || { echo "ERROR: no torch"; exit 1; }
 
-POTTER="${POTTER:-/tmp/claude-5033/-home-usr1-xg3787-projs-DiffRouter-py/4dd12ae8-e3ff-4789-826a-5238420035fd/scratchpad/Potter}"
+# Uses whatever `python` is active. Activate your environment before running, OR set both
+# CONDA_SH (path to conda.sh) and CONDA_ENV (env name) to have the script activate it.
+if [ -n "${CONDA_SH:-}" ] && [ -f "$CONDA_SH" ] && [ -n "${CONDA_ENV:-}" ]; then
+  # shellcheck disable=SC1090
+  . "$CONDA_SH" && conda activate "$CONDA_ENV"
+fi
+PY=$(command -v python)
+"$PY" -c "import torch" 2>/dev/null || {
+  echo "ERROR: no torch in '$PY'. Activate your Python env first, or set CONDA_SH and CONDA_ENV."
+  echo "       Dependencies: pip install -r requirements.txt"; exit 1; }
+
+# Path to the built Potter (potter/setup_potter.sh builds it into third_party/Potter).
+POTTER="${POTTER:-$ROOT/third_party/Potter}"
+[ -x "$POTTER/build/route" ] || {
+  echo "ERROR: Potter not found at '$POTTER/build/route'. Build it with potter/setup_potter.sh,"
+  echo "       or set POTTER=/path/to/Potter."; exit 1; }
 CVO="${CVO:-$ROOT/cvo}"
 OUT="${OUT:-$ROOT/egsweep}"
 RRG="${RRG:-data/rrg_xcvu3p_int.pt}"
