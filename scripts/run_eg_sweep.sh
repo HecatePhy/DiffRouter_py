@@ -112,22 +112,40 @@ done
 wait
 log "Potter (eg) done"
 
-# ---------- 3. metrics for eg (and copy ctrl/opt5 from cvo for side-by-side) ----------
+# ---------- 3. metrics for eg ----------
+# potter_s from /usr/bin/time -v (if available); guide_s from run_exp's own [optimize]
+# timer (the EG run is not time-wrapped, so the old "Elapsed (wall clock)" grep always
+# came up empty -- that is why runtime was blank).
 secs() { local t; t=$(grep -i "Elapsed (wall clock)" "$1" 2>/dev/null | tail -1 | grep -oE "[0-9:.]+$")
          [ -z "$t" ] && { echo ""; return; }; echo "$t" | awk -F: '{s=0;for(i=1;i<=NF;i++)s=s*60+$i;printf "%.0f",s}'; }
+warned_capnp=0
 for b in $BENCH; do
   o="$OUT/phys/$b.eg.phys"; [ -f "$o" ] || continue
   grep -q "^$b,eg," "$CSV" && continue
   wl="$OUT/logs/$b.eg.wa.log"; tw="$OUT/logs/$b.eg.twl.log"
-  [ -f "$wl" ] || (cd "$POTTER/wirelength_analyzer" && $PY -u wa.py "$o" > "$wl" 2>&1)
-  [ -f "$tw" ] || $PY -u scripts/total_wirelength.py "$o" --potter "$POTTER" --quiet > "$tw" 2>&1
+  [ -f "$wl" ] || (cd "$POTTER/wirelength_analyzer" && "$PY" -u wa.py "$o" > "$wl" 2>&1)
+  [ -f "$tw" ] || "$PY" -u scripts/total_wirelength.py "$o" --potter "$POTTER" --quiet > "$tw" 2>&1
   cp=$(grep -iE "^Wirelength:" "$wl" 2>/dev/null | head -1 | grep -oE "[0-9]+")
   tt=$(grep -E "^[0-9]+$" "$tw" 2>/dev/null | head -1)
+  # If the wirelength tools failed, say WHY (usually missing pycapnp) instead of blanking.
+  if [ -z "$cp$tt" ] && [ "$warned_capnp" = 0 ]; then
+    if grep -qiE "ModuleNotFoundError|ImportError|No module named|capnp" "$wl" "$tw" 2>/dev/null; then
+      echo "WARNING: wa.py / total_wirelength.py failed to import (cpwl/total_wl will be"
+      echo "         blank). Potter's wirelength analyzer needs pycapnp: pip install pycapnp"
+      echo "         (see $wl and $tw for the exact error)."
+    else
+      echo "WARNING: no cpwl/total_wl for $b -- see $wl and $tw."
+    fi
+    warned_capnp=1
+  fi
   nn=$(grep -oE "[0-9]+ nets matched" "$OUT/logs/$b.eg.potter.log" 2>/dev/null | head -1 | grep -oE "^[0-9]+")
-  gs=$(secs "$OUT/logs/$b.eg.log")
-  echo "$b,eg,${nn:-},${gs:-},$(secs "$OUT/logs/$b.eg.potter.log"),${cp:-},${tt:-}" >> "$CSV"
-  log "$b/eg: cpwl=${cp:-?} total_wl=${tt:-?}"
+  # EG global-route seconds: run_exp's [optimize] X.Ys timer (fallback to /usr/bin/time).
+  gs=$(grep -oE "\[optimize\] [0-9.]+s" "$OUT/logs/$b.eg.log" 2>/dev/null | tail -1 | grep -oE "[0-9.]+" | cut -d. -f1)
+  [ -z "$gs" ] && gs=$(secs "$OUT/logs/$b.eg.log")
+  ps=$(secs "$OUT/logs/$b.eg.potter.log")
+  echo "$b,eg,${nn:-},${gs:-},${ps:-},${cp:-},${tt:-}" >> "$CSV"
+  log "$b/eg: guide_s=${gs:-?} potter_s=${ps:-?} cpwl=${cp:-?} total_wl=${tt:-?}"
 done
 
 log "DONE -> $CSV"
-column -s, -t "$CSV"
+command -v column >/dev/null && column -s, -t "$CSV" || cat "$CSV"

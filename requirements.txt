@@ -12,6 +12,11 @@ numpy>=1.24
 # runs and prints numbers without it, only the PNG is skipped).
 matplotlib>=3.5
 
+# Wirelength metrics — Potter's wirelength_analyzer/wa.py and scripts/total_wirelength.py
+# parse routed .phys via Cap'n Proto. Without this, CPWL and total-WL come out blank
+# (the global route + guide export do NOT need it).
+pycapnp>=1.3
+
 # --- Not pip-installed here; required only for specific offline steps ---
 # rapidwright        RRG extraction / device parsing (RRG *build* only, not routing).
 #                    Java-backed; install per https://www.rapidwright.io/ if rebuilding
