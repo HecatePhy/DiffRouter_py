@@ -16,20 +16,15 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# Use the project env's python (the system python is too old for this code).
-CONDA_ENV="${CONDA_ENV:-diffrouter}"
-if [ -z "${CONDA_SH:-}" ]; then
-  for c in "$HOME/miniforge3" "$(dirname "$(dirname "$(command -v conda 2>/dev/null || echo /nonexistent)")")" \
-           "$HOME/miniconda3" "$HOME/anaconda3"; do
-    [ -f "$c/etc/profile.d/conda.sh" ] && { CONDA_SH="$c/etc/profile.d/conda.sh"; break; }
-  done
-fi
-if [ -n "${CONDA_SH:-}" ] && [ -f "$CONDA_SH" ]; then
+# Uses whatever `python` is active. Activate your environment before running, OR set both
+# CONDA_SH (path to conda.sh) and CONDA_ENV (env name) to have the script activate it.
+if [ -n "${CONDA_SH:-}" ] && [ -f "$CONDA_SH" ] && [ -n "${CONDA_ENV:-}" ]; then
   # shellcheck disable=SC1090
   . "$CONDA_SH" && conda activate "$CONDA_ENV"
 fi
 python -c "import torch" 2>/dev/null || {
-  echo "ERROR: no torch in '$(command -v python)'. Set CONDA_SH=/path/to/conda.sh CONDA_ENV=<env>."; exit 1; }
+  echo "ERROR: no torch in '$(command -v python)'. Activate your Python env first, or set"
+  echo "       CONDA_SH and CONDA_ENV.  Dependencies: pip install -r requirements.txt"; exit 1; }
 
 POTTER="${POTTER:-$ROOT/third_party/Potter}"   # built by potter/setup_potter.sh
 OUT="${OUT:-$ROOT/campaign}"
