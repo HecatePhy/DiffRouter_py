@@ -1,6 +1,8 @@
 fpga24_routing_contest/
 *.log
-data/
+# Ignore all of data/ (device file, benchmarks, net indices — all large / external).
+# data/* rather than data/ so git can still descend for the RRG exception at the bottom.
+data/*
 results/
 docs/
 
@@ -23,3 +25,7 @@ cpp/build/
 *.png
 campaign/
 results_*/
+
+# Keep the 12 MB RRG (small build artifact needed to run anything); must be LAST
+# to override both data/* and *.pt above.
+!data/rrg_xcvu3p_int.pt
