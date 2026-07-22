@@ -1,19 +1,20 @@
 #!/bin/bash
-# All-benchmark test of the EG (per-net simplex) optimizer for congestion-reducing guides.
+# All-benchmark run of the EG (per-net simplex) optimizer for congestion-reducing guides.
 #
-# Per benchmark, produces an 'eg' guide alongside the existing ctrl/opt5 guides from the
-# cvo campaign, routes all with Potter, and reports {extracted overflow, CPWL, total WL}.
+# Per benchmark, self-contained: builds the net index if missing, runs the EG global route
+# to produce a guide, routes it with Potter, and records {CPWL, total WL} to egsweep/.
 #
-#   ctrl : uniform-x guide (zero optimization)         -- corridor structure only
-#   opt5 : 5-iter Adam guide (box)                     -- measured ~ ctrl (no rerouting)
-#   eg   : EG guide (per-net simplex, reroutes)        -- the new mechanism
+# Prerequisites (checked up front, fails loudly if missing):
+#   - a Python env with torch/numpy (pip install -r requirements.txt)
+#   - a built Potter at $POTTER (potter/setup_potter.sh)
+#   - the RRG ($RRG) and device file ($DEV)
+#   - data/<name>/<name>_unrouted.phys for each benchmark
 #
-# eg vs ctrl on total WL / CPWL is the question that matters. On boom_soc_v2 the EG guide
-# cut EXTRACTED overflow -41% vs -0.12% for Adam; this checks whether that (a) generalizes
-# and (b) reaches the Potter-level metrics.
+# To compare against the ctrl (uniform-x) and opt5 (Adam) guides, run
+# scripts/run_control_vs_opt.sh first (writes cvo/results.csv); this script only produces
+# the 'eg' rows. Potter runs in parallel (quality is exact regardless of contention).
 #
-# Reuses cvo/ net indices, ctrl/opt5 guides, and phys. Potter runs in parallel (quality is
-# exact regardless of contention; runtimes are indicative only).
+# Config via env: BENCH, POTTER, RRG, DEV, OUT, THREADS, POT_PAR, NGPU, ITERS.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,15 +50,35 @@ CSV="$OUT/results.csv"
 [ -f "$CSV" ] || echo "benchmark,config,nets,guide_s,potter_s,cpwl,total_wl" > "$CSV"
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
+# ---------- prerequisites (fail loudly, not silently) ----------
+[ -f "$RRG" ] || { echo "ERROR: RRG not found at '$RRG'. Set RRG=/path/to/rrg_*.pt."; exit 1; }
+[ -f "$DEV" ] || { echo "ERROR: device file not found at '$DEV'. Set DEV=/path/to/*.device."; exit 1; }
+
 if [ -z "${BENCH:-}" ]; then
   BENCH=$(for d in data/*/; do b=$(basename "$d"); f="$d${b}_unrouted.phys"
           [ -f "$f" ] && echo "$(stat -c%s "$f") $b"; done | sort -n | awk '{print $2}')
 fi
+if [ -z "$BENCH" ]; then
+  echo "ERROR: no benchmarks found. Expected data/<name>/<name>_unrouted.phys for each"
+  echo "       benchmark (populate data/ first), or pass BENCH='name1 name2 ...'."; exit 1; fi
+log "benchmarks: $(echo $BENCH | wc -w) [$(echo $BENCH | tr '\n' ' ')]"
+
+# ---------- 0. net index per benchmark (build if missing) ----------
+# The EG global route needs a per-net corridor index. This used to be assumed present
+# from the cvo campaign; on a fresh checkout it must be built, else every benchmark below
+# is skipped and the sweep does nothing.
+for b in $BENCH; do
+  ls data/$b/net_index/*corr2*.pt >/dev/null 2>&1 && continue
+  log "$b: building net index"
+  $PY -u scripts/PrebuildNetIndex.py --testcase "$b" --rrg "$RRG" \
+      --edge-mode directed --edge-scope corridor --corridor-width 2 \
+      > "$OUT/logs/$b.netindex.log" 2>&1 || log "$b: NET INDEX FAILED (see $OUT/logs/$b.netindex.log)"
+done
 
 # ---------- 1. EG guides (one GPU each, round-robin) ----------
 gpu=0
 for b in $BENCH; do
-  ls data/$b/net_index/*corr2*.pt >/dev/null 2>&1 || { log "$b: no net index, skip"; continue; }
+  ls data/$b/net_index/*corr2*.pt >/dev/null 2>&1 || { log "$b: no net index (build failed), skip"; continue; }
   if [ ! -f "$OUT/guides/$b.eg.guide" ]; then
     CUDA_VISIBLE_DEVICES=$gpu $PY -u run_exp.py --testcase "$b" --global-only --rrg "$RRG" \
         --connectivity-solver grouped --conn-warm-start \
