@@ -30,6 +30,14 @@ PY=$(command -v python)
 "$PY" -c "import torch" 2>/dev/null || {
   echo "ERROR: no torch in '$PY'. Activate your Python env first, or set CONDA_SH and CONDA_ENV."
   echo "       Dependencies: pip install -r requirements.txt"; exit 1; }
+# The EG global route wants a GPU; a CPU-only torch runs but is far slower (and
+# nvidia-smi shows nothing). Warn up front rather than per-benchmark.
+"$PY" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null || {
+  echo "WARNING: torch.cuda.is_available() is False in '$PY' -- the global route will run"
+  echo "         on CPU (slow; nvidia-smi will show no usage). Your PyTorch is likely a"
+  echo "         CPU-only build or its CUDA version doesn't match the driver. Reinstall the"
+  echo "         matching wheel from https://pytorch.org. Continuing on CPU in 5s..."
+  sleep 5; }
 
 # Path to the built Potter (potter/setup_potter.sh builds it into third_party/Potter).
 POTTER="${POTTER:-$ROOT/third_party/Potter}"

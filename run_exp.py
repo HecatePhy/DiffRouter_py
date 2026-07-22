@@ -112,9 +112,26 @@ def _load_router(args, device):
 
 
 def run_pipeline(args) -> dict:
-    device = torch.device(
-        "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    if args.cpu:
+        device = torch.device("cpu")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        # Silent CPU fallback here means the whole global route runs on CPU (very slow,
+        # and nvidia-smi shows nothing). Make it loud -- almost always a CPU-only torch
+        # build or a CUDA/driver mismatch, not an intended CPU run.
+        device = torch.device("cpu")
+        print(
+            "WARNING: CUDA is not available (torch.cuda.is_available() is False) -- "
+            "running on CPU, which is far slower for the global route.\n"
+            f"         torch was built for CUDA={torch.version.cuda!r}. If this machine "
+            "has a GPU, your PyTorch is likely a CPU-only build or its CUDA version does "
+            "not match the driver.\n"
+            "         Reinstall the matching wheel from https://pytorch.org (e.g. "
+            "`pip install torch --index-url https://download.pytorch.org/whl/cu121`), or "
+            "pass --cpu to silence this and run on CPU deliberately.",
+            flush=True,
+        )
     data_prefix = args.data
     testcase = args.testcase
     netlist_path = os.path.join(data_prefix, testcase, f"{testcase}.netlist")
