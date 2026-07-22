@@ -2,7 +2,8 @@
 # All-benchmark run of the EG (per-net simplex) optimizer for congestion-reducing guides.
 #
 # Per benchmark, self-contained: builds the net index if missing, runs the EG global route
-# to produce a guide, routes it with Potter, and records {CPWL, total WL} to egsweep/.
+# to produce a guide, routes it with Potter, and records CPWL to egsweep/ (also total WL
+# if TOTWL=1 -- off by default: slow, and its total is not aligned with other tools).
 #
 # Prerequisites (checked up front, fails loudly if missing):
 #   - a Python env with torch/numpy (pip install -r requirements.txt)
@@ -52,6 +53,10 @@ THREADS="${THREADS:-32}"
 POT_PAR="${POT_PAR:-4}"
 NGPU="${NGPU:-4}"
 ITERS="${ITERS:-25}"      # EG converges by ~25 outers; overflow early-stop may stop sooner
+TOTWL="${TOTWL:-0}"       # 1 = also compute total WL (scripts/total_wirelength.py). Off by
+                          # default: it is a slow Python loop over every routed segment
+                          # (~90s/design on the big ones) and its PIP-based total is not
+                          # aligned with other tools' wirelength. CPWL (wa.py) is always run.
 
 mkdir -p "$OUT/logs" "$OUT/guides" "$OUT/phys"
 CSV="$OUT/results.csv"
@@ -134,12 +139,15 @@ for b in $BENCH; do
 
   # 4. metrics (CPWL + total WL)
   grep -q "^$b,eg," "$CSV" && { log "  [4/4] $b: already in CSV"; continue; }
-  log "  [4/4] $b: computing CPWL + total WL"
   wl="$OUT/logs/$b.eg.wa.log"; tw="$OUT/logs/$b.eg.twl.log"
+  log "  [4/4] $b: computing CPWL$([ "$TOTWL" = 1 ] && echo ' + total WL')"
   [ -f "$wl" ] || (cd "$POTTER/wirelength_analyzer" && "$PY" -u wa.py "$o" > "$wl" 2>&1)
-  [ -f "$tw" ] || "$PY" -u scripts/total_wirelength.py "$o" --potter "$POTTER" --quiet > "$tw" 2>&1
   cp=$(grep -iE "^Wirelength:" "$wl" 2>/dev/null | head -1 | grep -oE "[0-9]+")
-  tt=$(grep -E "^[0-9]+$" "$tw" 2>/dev/null | head -1)
+  tt=""
+  if [ "$TOTWL" = 1 ]; then
+    [ -f "$tw" ] || "$PY" -u scripts/total_wirelength.py "$o" --potter "$POTTER" --quiet > "$tw" 2>&1
+    tt=$(grep -E "^[0-9]+$" "$tw" 2>/dev/null | head -1)
+  fi
   if [ -z "$cp$tt" ] && [ "$warned_capnp" = 0 ]; then
     # Show the ACTUAL missing module rather than guessing -- the analyzer needs pycapnp
     # AND networkx AND the capnp schema, all in the env that runs this script.
