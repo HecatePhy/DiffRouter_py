@@ -187,6 +187,7 @@ def run_pipeline(args) -> dict:
                 conn_freeze_outer=args.conn_freeze_outer,
                 early_stop_tol=args.early_stop_tol,
                 early_stop_patience=args.early_stop_patience,
+                overflow_stop_frac=args.overflow_stop_frac,
                 connectivity_solver=args.connectivity_solver,
                 conn_net_batch=args.conn_net_batch,
                 flow_net_batch=args.flow_net_batch,
@@ -445,6 +446,12 @@ def main():
                              "Adapts iteration count to the design instead of a fixed cap.")
     parser.add_argument("--early-stop-patience", type=int, default=3,
                         help="Outer iters the early-stop improvement is measured over")
+    parser.add_argument("--overflow-stop-frac", type=float, default=0.0,
+                        help="EG early stop: halt once relaxed overflow falls below "
+                             "this fraction of its first-outer value (0=off). The EG "
+                             "reroute converges when overflow crosses ~1%% of its "
+                             "initial value; iterations past that only sharpen "
+                             "magnitudes the guide ignores. Try 0.01 (totwl-driven).")
     parser.add_argument("--conn-super-sink", action="store_true",
                         help="B1: 1 connectivity column/net (source->merged super-sink)")
     parser.add_argument("--conn-bf16", action="store_true",

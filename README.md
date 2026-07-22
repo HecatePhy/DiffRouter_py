@@ -92,12 +92,12 @@ redistributed across its corridor rather than rescaled in place.
 python run_exp.py --testcase boom_soc_v2 --global-only \
     --connectivity-solver grouped --conn-warm-start \
     --conn-col-chunk 128 --conn-cg-max-iter 8 --conn-every 5 \
-    --max-iterations 40 --num-inner 5 --skip-extract \
+    --max-iterations 25 --num-inner 5 --skip-extract \
     --init-mode shortest_path --init-off-path 0.01 \
     --optimizer-kind eg --eg-lr 0.5 --eg-clip 1.0 \
     --congestion-mode soft --congestion-tau 0.1 \
     --lam-update mult --lam-mult-eta 0.5 --lam-base 1.0 \
-    --conn-sat-alpha 1.5 \
+    --conn-sat-alpha 1.5 --overflow-stop-frac 0.01 \
     --guide-out bsv2.guide
 
 # 2. Potter, gentle guide
@@ -285,6 +285,7 @@ optimization moves over a per-net simplex. All flags below default to the Adam b
 | `--lam-mult-eta`, `--lam-base` | 0.5 / 1.0 | `--lam-update mult`: growth rate per outer, and initial `λ` |
 | `--conn-sat-alpha A` | 0.0 | Saturating connectivity `Σ relu(R_eff - A·d_min)` (`d_min` = min-hop distance); `0` = plain `Σ R_eff` |
 | `--flow-demand` | `fanout` | `fanout` = `{src:-K, sink:+1}`; `normalized` = `{src:-1, sink:+1/K}` |
+| `--overflow-stop-frac F` | 0.0 | Early stop once relaxed overflow falls below `F` of its first-outer value (`0` = off). EG rerouting converges when overflow crosses ~1% of initial; `0.01` with `--max-iterations 25` is the totwl-driven default |
 
 ### Guide export (for Potter)
 

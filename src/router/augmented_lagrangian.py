@@ -77,6 +77,7 @@ def optimize_augmented_lagrangian(
     lam_base: float = 1.0,
     early_stop_tol: float = 0.0,
     early_stop_patience: int = 3,
+    overflow_stop_frac: float = 0.0,
     connectivity: str = "effective_resistance",
     connectivity_solver: str = "grouped",
     conn_net_batch: int = 0,
@@ -177,6 +178,7 @@ def optimize_augmented_lagrangian(
               f"every {balance_every} outer(s)")
 
     ovf_hist: list = []
+    ovf_baseline = None
     w_conn_bal = w_conn
     for outer in range(start_outer, num_outer):
         # Gradient balancing (opt-in). Measured on boom_soc_v2: ||grad|| is 7.2e4 for
@@ -293,6 +295,31 @@ def optimize_augmented_lagrangian(
         # Only arm once rho has reached rho_max: overflow legitimately RISES while the
         # penalty ramps (flow spreads before it is squeezed), so an earlier check would
         # fire on that transient.
+        # Overflow-fraction early stop (EG mode): stop once relaxed overflow has fallen
+        # below overflow_stop_frac of its FIRST-outer value. Measured on boom_soc_v2, the
+        # EG rerouting is done (crossings plateaued, overflow -99%) by the outer where
+        # overflow crosses ~1% of its initial value; iterations past that only sharpen
+        # magnitudes the argmin guide ignores (validated: iter-25 vs iter-40 total WL
+        # within Potter noise, mean -0.08%). Absolute-fraction, not relative-improvement:
+        # overflow bounces near its floor, which fools an improvement<tol rule.
+        if overflow_stop_frac > 0:
+            # Measure HARD overflow (relu), not the training `overflows`: with
+            # --congestion-mode soft the latter is a softplus that never approaches 0, so
+            # it never crosses overflow_stop_frac of its initial value and the stop would
+            # never fire. The convergence curve that set this threshold used hard overflow,
+            # which drops ~99% as the reroute resolves.
+            with torch.no_grad():
+                hard_ovf = float(torch.relu(
+                    router._phys_usage(x) - router._phys_capacity_tensor).sum().item())
+            if ovf_baseline is None:
+                ovf_baseline = hard_ovf        # first-outer value
+            elif hard_ovf <= overflow_stop_frac * ovf_baseline:
+                if verbose:
+                    print(f"      [early-stop] outer {outer+1} (iter {total_iter}): "
+                          f"overflow={hard_ovf:.4g} <= {overflow_stop_frac:.0%} of initial "
+                          f"{ovf_baseline:.4g} -- rerouting converged")
+                break
+
         if early_stop_tol > 0:
             ovf_hist.append(float(overflows.sum().item()))
             if rho >= rho_max and len(ovf_hist) > early_stop_patience:
