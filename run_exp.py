@@ -70,6 +70,13 @@ def _load_router(args, device):
         router.conn_warm_start = getattr(args, "conn_warm_start", True)
         router.conn_max_sinks = getattr(args, "conn_max_sinks", 0)
         router.conn_super_sink = getattr(args, "conn_super_sink", False)
+        router.conn_sat_alpha = getattr(args, "conn_sat_alpha", 0.0)
+        router.flow_demand_mode = getattr(args, "flow_demand", "fanout")
+        router.congestion_mode = getattr(args, "congestion_mode", "hard")
+        router.congestion_tau = getattr(args, "congestion_tau", 0.1)
+        router.init_mode = getattr(args, "init_mode", "uniform")
+        router.init_on_path = getattr(args, "init_on_path", 1.0)
+        router.init_off_path = getattr(args, "init_off_path", 0.0)
         _ng = getattr(args, "conn_multi_gpu", 1)
         router.conn_mg_devices = (
             [torch.device("cuda:%d" % i) for i in range(_ng)] if _ng > 1 else None)
@@ -91,6 +98,13 @@ def _load_router(args, device):
     router.conn_warm_start = getattr(args, "conn_warm_start", True)
     router.conn_max_sinks = getattr(args, "conn_max_sinks", 0)
     router.conn_super_sink = getattr(args, "conn_super_sink", False)
+    router.conn_sat_alpha = getattr(args, "conn_sat_alpha", 0.0)
+    router.flow_demand_mode = getattr(args, "flow_demand", "fanout")
+    router.congestion_mode = getattr(args, "congestion_mode", "hard")
+    router.congestion_tau = getattr(args, "congestion_tau", 0.1)
+    router.init_mode = getattr(args, "init_mode", "uniform")
+    router.init_on_path = getattr(args, "init_on_path", 1.0)
+    router.init_off_path = getattr(args, "init_off_path", 0.0)
     _ng = getattr(args, "conn_multi_gpu", 1)
     router.conn_mg_devices = (
         [torch.device("cuda:%d" % i) for i in range(_ng)] if _ng > 1 else None)
@@ -161,6 +175,15 @@ def run_pipeline(args) -> dict:
                 w_disc=args.w_disc,
                 disc_ramp_outer=args.disc_ramp_outer,
                 conn_every=args.conn_every,
+                grad_balance=args.grad_balance,
+                balance_ratio=args.balance_ratio,
+                balance_every=args.balance_every,
+                optimizer_kind=args.optimizer_kind,
+                eg_lr=args.eg_lr,
+                eg_clip=args.eg_clip,
+                lam_update=args.lam_update,
+                lam_mult_eta=args.lam_mult_eta,
+                lam_base=args.lam_base,
                 conn_freeze_outer=args.conn_freeze_outer,
                 early_stop_tol=args.early_stop_tol,
                 early_stop_patience=args.early_stop_patience,
@@ -334,6 +357,84 @@ def main():
     parser.add_argument("--conn-max-sinks", type=int, default=0,
                         help="Cap connectivity to first K sinks/net (0=all). Cheap runtime "
                              "lever: huge-fanout nets dominate connectivity cost.")
+    parser.add_argument("--init-mode", choices=["uniform", "shortest_path"],
+                        default="uniform",
+                        help="Initial x. 'uniform' (default) spreads 0.1 over each net's "
+                             "corridor, so x~5e-4: usage is then far below capacity, the "
+                             "congestion relu has zero gradient, and dR/dw~1/w^2 makes "
+                             "effective resistance ~1e8x every other term. "
+                             "'shortest_path' starts from the min-hop routing instead, so "
+                             "conductances are O(1) and usage is a real net count.")
+    parser.add_argument("--init-on-path", type=float, default=1.0,
+                        help="--init-mode shortest_path: x on the chosen path edges.")
+    parser.add_argument("--init-off-path", type=float, default=0.0,
+                        help="--init-mode shortest_path: x on all other corridor edges.")
+    parser.add_argument("--optimizer-kind", choices=["adam", "eg"], default="adam",
+                        help="Inner update. 'adam' (default): additive on the box "
+                             "[0,1]^E -- measured to NEVER reroute (Jaccard 1.0 support "
+                             "vs init) because on a box every congestion loss is minimised "
+                             "by shrinking x. 'eg': exponentiated-gradient / mirror descent "
+                             "with a per-net mass constraint -- each net's total x is "
+                             "pinned, so congestion can only fall by MOVING mass onto "
+                             "connected alternatives (a simplex, not a box). Requires an "
+                             "init with off-path x>0, e.g. --init-mode shortest_path "
+                             "--init-off-path 0.01.")
+    parser.add_argument("--eg-lr", type=float, default=0.5,
+                        help="EG step size (dimensionless; gradient is per-net RMS-"
+                             "normalised, so ~0.1-1 regardless of loss scale).")
+    parser.add_argument("--eg-clip", type=float, default=1.0,
+                        help="EG per-step exponent clip: one step moves any edge by at "
+                             "most a factor exp(eg_clip).")
+    parser.add_argument("--lam-update", choices=["meng", "mult"], default="meng",
+                        help="Multiplier update. 'meng' (default): normalised subgradient "
+                             "-- measured decorative (lam_max=0.0104, 190000x below the rho "
+                             "term). 'mult': PathFinder-style history "
+                             "lam<-lam*(1+eta*relu(u/c-1)), so persistently over-capacity "
+                             "edges keep getting more expensive (a ratchet).")
+    parser.add_argument("--lam-mult-eta", type=float, default=0.5,
+                        help="--lam-update mult: geometric growth rate per outer.")
+    parser.add_argument("--lam-base", type=float, default=1.0,
+                        help="--lam-update mult: initial lam (0*anything=0, so mult needs "
+                             "a positive seed).")
+    parser.add_argument("--congestion-mode", choices=["hard", "soft"], default="hard",
+                        help="Overflow signal. 'hard' (default): relu(usage-capacity) -- "
+                             "ZERO gradient below capacity, so no preventive spreading "
+                             "(measured: overflow exactly 0 at uniform init => lam/rho "
+                             "never engage). 'soft': capacity-relative softplus, gradient "
+                             "everywhere and scale-free across heterogeneous capacities "
+                             "(mean 31.6, median 30); -> hard as tau->0.")
+    parser.add_argument("--congestion-tau", type=float, default=0.1,
+                        help="--congestion-mode soft: softness (fraction of capacity).")
+    parser.add_argument("--flow-demand", choices=["fanout", "normalized"],
+                        default="fanout",
+                        help="Kirchhoff demand. 'fanout' (default): {src:-K, sink:+1} -- "
+                             "measured 99.93%% x-independent constant, unsatisfiable for "
+                             "5.2%% of nets (source must push K units through <=13 edges "
+                             "with x<=1), and its ~-2K gradient on source edges generates "
+                             "congestion at high-fanout sources. 'normalized': scaled by "
+                             "1/K -> {src:-1, sink:+1/K}; satisfiable, and consistent "
+                             "with x as an edge indicator (trunk edge carries 1).")
+    parser.add_argument("--conn-sat-alpha", type=float, default=0.0,
+                        help="Saturating connectivity (0 = off, plain sum of effective "
+                             "resistance). If >0, the loss becomes "
+                             "sum_col relu(R_eff - alpha*d_min), where d_min is the net's "
+                             "min-hop distance (= the R_eff of one clean shortest path). "
+                             "Plain sum(R_eff) keeps rewarding extra parallel paths "
+                             "forever (parallel resistors); saturating stops the reward "
+                             "once a net is connected well enough. Try 1.5-3.")
+    parser.add_argument("--grad-balance", choices=["off", "conn"], default="off",
+                        help="Rescale w_conn each outer so ||w_conn*grad_conn|| = "
+                             "--balance-ratio * ||grad_wl||. Measured on boom_soc_v2: "
+                             "wirelength 7.2e4, congestion penalty 2.7e7, effective "
+                             "resistance 1.3e13-3.2e14 -- so ER is ~1e10x the rest and the "
+                             "AL optimises it alone. lambda cannot fix that (it weights "
+                             "the constraint, not the objective, and its normalised update "
+                             "grows ||lambda|| by exactly lr_lam per outer).")
+    parser.add_argument("--balance-ratio", type=float, default=1.0,
+                        help="--grad-balance target: ||w_conn*grad_conn|| / ||grad_wl||.")
+    parser.add_argument("--balance-every", type=int, default=1,
+                        help="--grad-balance: rebalance every N outers (one extra "
+                             "connectivity solve each time).")
     parser.add_argument("--conn-every", type=int, default=1,
                         help="A1: evaluate connectivity every K inner iters (1=every step)")
     parser.add_argument("--conn-freeze-outer", type=int, default=0,

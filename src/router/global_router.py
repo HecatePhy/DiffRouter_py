@@ -760,7 +760,23 @@ class GlobalRouter(nn.Module):
             f"p10={stats['p10_int_tiles']} p90={stats['p90_int_tiles']}"
         )
 
-    def init_variables(self) -> torch.Tensor:
+    def init_variables(self, mode: str = None) -> torch.Tensor:
+        """Initial x.
+
+        mode='uniform' (default, unchanged): spread 0.1 over each net's corridor.
+        mode='shortest_path' (opt-in): start from the min-hop routing -- on_path on the
+            chosen edges, off_path elsewhere. See gpu_guide.shortest_path_x.
+        """
+        mode = mode or getattr(self, "init_mode", "uniform")
+        if mode == "shortest_path":
+            from src.router.gpu_guide import shortest_path_x
+
+            x = shortest_path_x(
+                self, self.device,
+                on_path=float(getattr(self, "init_on_path", 1.0)),
+                off_path=float(getattr(self, "init_off_path", 0.0)),
+            )
+            return x.detach().clone().requires_grad_(True)
         offsets = torch.tensor(self._var_offset, dtype=torch.long)
         sizes = offsets[1:] - offsets[:-1]
         nonzero = sizes.clamp_min(1)
@@ -798,8 +814,37 @@ class GlobalRouter(nn.Module):
             return torch.tensor(0.0, device=self.device, dtype=x.dtype)
         flow = torch.zeros(self._total_local_nodes, device=self.device, dtype=x.dtype)
         flow = flow.index_add(0, self._flat_v, x).index_add(0, self._flat_u, -x)
-        imbalance = flow - self._flow_demand.to(x.dtype)
+        imbalance = flow - self._get_flow_demand().to(x.dtype)
         return (imbalance * imbalance).sum()
+
+    def _get_flow_demand(self) -> torch.Tensor:
+        """Demand vector for the Kirchhoff penalty, per flow_demand_mode.
+
+        'fanout' (default, unchanged): {src: -K, each sink: +1}. Measured broken on
+        boom_soc_v2: the loss is 99.93% the x-independent constant sum_nets(K^2+K); the
+        source must push K units through <=13 outgoing edges each clamped to x<=1, which
+        is unsatisfiable for 5.2% of nets (worst: K=1193 vs out-degree 12); and its
+        gradient ~ -2K on source edges pins high-fanout sources' x at 1.0 -- a congestion
+        generator on exactly the nets that congest.
+
+        'normalized': the same vector scaled by 1/K per net -> {src: -1, sink: +1/K}.
+        Satisfiable (|demand| <= 1 everywhere <= out-degree), and consistent with x as an
+        indicator: a trunk edge feeding all K sinks carries sum(1/K) = 1 = "this edge is
+        used". Branch edges carry the fraction of downstream sinks.
+        """
+        mode = getattr(self, "flow_demand_mode", "fanout")
+        if mode != "normalized":
+            return self._flow_demand
+        if getattr(self, "_flow_demand_norm", None) is None:
+            d = self._flow_demand
+            counts = torch.tensor(self._node_offset, device=d.device).diff()
+            node_net = torch.repeat_interleave(
+                torch.arange(self.num_nets, device=d.device), counts)
+            # per-net K = sinks present in the corridor = sum of the +1 entries
+            k = torch.zeros(self.num_nets, device=d.device, dtype=d.dtype)
+            k.index_add_(0, node_net, d.clamp_min(0))
+            self._flow_demand_norm = d / k.clamp_min(1.0)[node_net]
+        return self._flow_demand_norm
 
     def _flow_conservation_loss_sampled(self, x: torch.Tensor, net_batch: int) -> torch.Tensor:
         """Legacy per-net subsampled flow loss (net_batch > 0)."""
@@ -818,19 +863,59 @@ class GlobalRouter(nn.Module):
             )
         return loss * (self.num_nets / net_batch)
 
+    def _overflow_fn(self, diff: torch.Tensor, capacity: torch.Tensor) -> torch.Tensor:
+        """Overflow signal for the AL penalty / lambda update / congestion_loss.
+
+        'hard' (default, unchanged): relu(usage - capacity). Measured zero gradient
+        below capacity: overflow is EXACTLY 0 at the uniform init (boom_soc_v2), so
+        lambda stays at ||lambda||=0.0000 and rho never ramps until a hot edge already
+        exists -- see diffrouter-optimization-contributes-nothing memory.
+        'soft': capacity * tau * softplus((usage-capacity)/(capacity*tau)). Gradient
+        everywhere (pressure persists near the boundary instead of cutting off exactly
+        at it), and RELATIVE to capacity, so a violation is judged the same whether the
+        edge's capacity is 5 or 60 (measured RRG capacity mean=31.6, median=30 -- highly
+        non-uniform). Exact limit: tau*softplus(z/tau) -> max(z,0) as tau -> 0, so this
+        recovers relu(usage-capacity) exactly as tau shrinks.
+        """
+        mode = getattr(self, "congestion_mode", "hard")
+        if mode != "soft":
+            return torch.relu(diff)
+        tau = float(getattr(self, "congestion_tau", 0.1))
+        cap = capacity.clamp_min(1e-12)
+        return cap * tau * torch.nn.functional.softplus(diff / (cap * tau))
+
+    def _phys_usage(self, x: torch.Tensor) -> torch.Tensor:
+        """Usage aligned to physical-edge indexing (same indexing as lam/capacity).
+
+        `_get_usage_and_overflows` returns usage PRE-merge (directed-edge-level, size
+        _num_global_edges) which is NOT aligned with lam/capacity (indexed by physical
+        edge). This returns the capacity-aligned version, for callers that need the
+        usage/capacity RATIO (e.g. the multiplicative lambda update), not just overflow.
+        """
+        usage = torch.zeros(self._num_global_edges, device=self.device, dtype=x.dtype)
+        if self.num_vars > 0:
+            usage = usage.scatter_add(0, self._flat_edge_idx, x)
+        if self.edge_mode == "undirected":
+            return usage
+        num_phys = len(self.rrg.phys_list)
+        phys_usage = torch.zeros(num_phys, device=self.device, dtype=x.dtype)
+        return phys_usage.index_add(0, self._d2p, usage)
+
     def _get_usage_and_overflows(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         usage = torch.zeros(self._num_global_edges, device=self.device, dtype=x.dtype)
         if self.num_vars > 0:
             usage = usage.scatter_add(0, self._flat_edge_idx, x)
 
         if self.edge_mode == "undirected":
-            overflows = torch.relu(usage - self._phys_capacity_tensor)
+            overflows = self._overflow_fn(usage - self._phys_capacity_tensor,
+                                          self._phys_capacity_tensor)
             return usage, overflows
 
         num_phys = len(self.rrg.phys_list)
         phys_usage = torch.zeros(num_phys, device=self.device, dtype=x.dtype)
         phys_usage = phys_usage.index_add(0, self._d2p, usage)
-        overflows = torch.relu(phys_usage - self._phys_capacity_tensor)
+        overflows = self._overflow_fn(phys_usage - self._phys_capacity_tensor,
+                                      self._phys_capacity_tensor)
         return usage, overflows
 
     def congestion_loss(self, x: torch.Tensor, penalty: str = "soft") -> torch.Tensor:
@@ -845,6 +930,85 @@ class GlobalRouter(nn.Module):
         net_batch: int = 0,
     ) -> torch.Tensor:
         return self._connectivity_grouped_or_loop(x, solver, eps, net_batch)
+
+    def _conn_sat_target(self, alpha: float) -> torch.Tensor:
+        """Per-column R_eff target for the saturating connectivity loss (grouped solver).
+
+        With x=1 along a path of d edges the source-sink effective resistance is exactly
+        d (series resistors), so a net's min-hop distance is the R_eff it gets from one
+        clean shortest path. target = alpha * d_min then means "stop paying for
+        connectivity once this net is within alpha of a single clean path": alpha > 1
+        leaves slack for detours, alpha = 1 demands a shortest path, and alpha < 1 would
+        only be reachable by adding parallel paths -- i.e. it re-buys the redundancy this
+        is meant to stop.
+
+        Unreachable columns get target = inf, so they contribute no gradient: they have no
+        path inside their corridor at all, which widening the corridor -- not the loss --
+        is what fixes.
+        """
+        cache = getattr(self, "_sat_cache", None)
+        if cache is not None and cache[0] == alpha:
+            return cache[1]
+        if getattr(self, "conn_super_sink", False):
+            raise ValueError(
+                "conn_sat is not supported with --conn-super-sink: the super-sink column's "
+                "RHS is {src:+1, sinks:-1/k}, so its quadratic form is not a source-sink "
+                "resistance and the min-hop target below does not apply to it."
+            )
+        conn = self._grouped_conn()
+        dev = self.device
+        fu = conn["flat_u"].long().to(dev)
+        fv = conn["flat_v"].long().to(dev)
+        src = conn["src_flat"].long().to(dev)
+        sink = conn["sink_flat"].long().to(dev)
+        # Nets are disjoint blocks of the flat node space, so one Bellman-Ford from all
+        # sources at once gives every node its own net's min-hop distance.
+        cost = torch.ones(fu.numel(), device=dev)
+        dist = torch.full((int(conn["num_nodes"]),), float("inf"), device=dev)
+        dist[src] = 0.0
+        for _ in range(400):
+            new = dist.clone()
+            new.scatter_reduce_(0, fv, dist[fu] + cost, reduce="amin")
+            new.scatter_reduce_(0, fu, dist[fv] + cost, reduce="amin")
+            if torch.equal(new, dist):
+                break
+            dist = new
+        target = alpha * dist[sink]
+        n_inf = int(torch.isinf(target).sum())
+        if n_inf:
+            print(f"  [conn-sat] WARNING: {n_inf}/{target.numel()} connections unreachable "
+                  f"inside their corridor -- they get no connectivity gradient.", flush=True)
+        self._sat_cache = (alpha, target)
+        return target
+
+    def term_grad_norms(self, x: torch.Tensor, lam=None, rho: float = 0.0,
+                        connectivity_solver: str = "grouped") -> dict:
+        """||grad|| of each loss term separately, for gradient balancing / diagnosis.
+
+        One backward per term, so this is as expensive as an extra connectivity solve --
+        call it every K outers, not every inner step.
+        """
+        out = {}
+
+        def _n(fn):
+            xx = x.detach().clone().requires_grad_(True)
+            v = fn(xx)
+            if not v.requires_grad:
+                return float(v), 0.0
+            v.backward()
+            return float(v), float(xx.grad.norm())
+
+        out["wirelength"] = _n(self.wirelength_loss)
+        out["flow"] = _n(self.flow_conservation_loss)
+        out["connectivity"] = _n(lambda z: self.connectivity_loss_effective_resistance(
+            z, solver=connectivity_solver))
+        if lam is not None:
+            out["penalty_linear"] = _n(
+                lambda z: (lam * self._get_usage_and_overflows(z)[1]).sum())
+        if rho:
+            out["penalty_quad"] = _n(
+                lambda z: (rho / 2) * (self._get_usage_and_overflows(z)[1] ** 2).sum())
+        return out
 
     def _build_supersink_conn(self) -> Optional[dict]:
         """B1: one connectivity column per net (source -> merged super-sink).
@@ -932,6 +1096,11 @@ class GlobalRouter(nn.Module):
                 # warm-start cache persists across AL iterations (enable via conn_warm_start)
                 self._grouped_ws = {} if getattr(self, "conn_warm_start", True) else None
             conn = self._grouped_conn()
+            # Saturating connectivity (opt-in): loss = sum_col relu(R_eff - alpha*d_min)
+            # instead of sum_col R_eff, so a net stops paying once it is connected well
+            # enough and the optimiser cannot keep buying redundant parallel paths.
+            sat_alpha = float(getattr(self, "conn_sat_alpha", 0.0) or 0.0)
+            sat_target = self._conn_sat_target(sat_alpha) if sat_alpha > 0 else None
             return effective_resistance_loss_grouped(
                 x,
                 conn,
@@ -943,6 +1112,7 @@ class GlobalRouter(nn.Module):
                 col_chunk=getattr(self, "conn_col_chunk", 128),
                 precond=getattr(self, "conn_precond", "none"),
                 ws_cache=self._grouped_ws,
+                sat_target=sat_target,
                 _mg_devices=getattr(self, "conn_mg_devices", None),
                 _group_cache=self._grouped_gcache,
             )
