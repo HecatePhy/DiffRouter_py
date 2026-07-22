@@ -141,13 +141,14 @@ for b in $BENCH; do
   cp=$(grep -iE "^Wirelength:" "$wl" 2>/dev/null | head -1 | grep -oE "[0-9]+")
   tt=$(grep -E "^[0-9]+$" "$tw" 2>/dev/null | head -1)
   if [ -z "$cp$tt" ] && [ "$warned_capnp" = 0 ]; then
-    if grep -qiE "ModuleNotFoundError|ImportError|No module named|capnp" "$wl" "$tw" 2>/dev/null; then
-      echo "WARNING: wa.py / total_wirelength.py failed to import (cpwl/total_wl will be"
-      echo "         blank). Potter's wirelength analyzer needs pycapnp: pip install pycapnp"
-      echo "         (see $wl and $tw for the exact error)."
-    else
-      echo "WARNING: no cpwl/total_wl for $b -- see $wl and $tw."
-    fi
+    # Show the ACTUAL missing module rather than guessing -- the analyzer needs pycapnp
+    # AND networkx AND the capnp schema, all in the env that runs this script.
+    realerr=$(grep -hoE "No module named '[^']+'|cannot import '[^']+'|ERROR: .*wirelength analyzer.*" "$tw" "$wl" 2>/dev/null | head -1)
+    echo "WARNING: cpwl/total_wl blank for $b -- the wirelength analyzer failed to import."
+    [ -n "$realerr" ] && echo "         actual error: $realerr"
+    echo "         Needs pycapnp + networkx + Potter's capnp schema, in THIS python env:"
+    echo "             pip install pycapnp networkx"
+    echo "         Full traceback: $tw  and  $wl"
     warned_capnp=1
   fi
   nn=$(grep -oE "[0-9]+ nets matched" "$OUT/logs/$b.eg.potter.log" 2>/dev/null | head -1 | grep -oE "^[0-9]+")

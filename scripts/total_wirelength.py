@@ -52,10 +52,25 @@ def main():
     sys.path.insert(0, schema_dir)
     os.chdir(wa_dir)   # wa.py/capnp resolve schema paths relative to themselves
 
-    import capnp  # noqa: F401
-    import PhysicalNetlist_capnp
-    from wa import WirelengthAnalyzer
-    from xcvup_device_data import xcvupDeviceData
+    # Name the exact missing piece rather than a generic ImportError -- the wirelength
+    # tools pull in several things (pycapnp, networkx, the capnp schema, Potter's local
+    # xcvup_device_data), and "No module named X" tells you which to install/fix.
+    try:
+        import capnp  # noqa: F401  (pip install pycapnp)
+        import PhysicalNetlist_capnp  # noqa: F401  (capnp schema at schema_dir, above)
+        from wa import WirelengthAnalyzer  # also imports networkx
+        from xcvup_device_data import xcvupDeviceData
+    except ImportError as exc:
+        name = getattr(exc, "name", None) or str(exc)
+        hint = {
+            "capnp": "pip install pycapnp",
+            "networkx": "pip install networkx",
+            "PhysicalNetlist_capnp": "capnp schema missing under Potter -- re-run "
+                                     "potter/setup_potter.sh (creates fpga-interchange-schema/interchange)",
+            "xcvup_device_data": f"expected in {wa_dir} -- your Potter checkout is incomplete",
+        }.get(name, "install it into the SAME python env that runs this script")
+        sys.exit(f"ERROR: cannot import '{name}' for the wirelength analyzer -> {hint}\n"
+                 f"       (python: {sys.executable})")
 
     t0 = time.time()
     with gzip.open(phys_path, "rb") as f:
