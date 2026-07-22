@@ -48,6 +48,17 @@ fi
 echo "==> building (needs cmake, a C++17 compiler, zlib, boost-serialization)"
 make build
 
+# The Python wirelength tools (wa.py for CPWL, scripts/total_wirelength.py for total WL)
+# import the Cap'n Proto schema from $DEST/fpga-interchange-schema/interchange. Some Potter
+# checkouts only ship it under libs/interchange/definition; make the expected path resolve
+# either way so CPWL / total-WL don't fail with "No module named PhysicalNetlist_capnp".
+if [ ! -f "$DEST/fpga-interchange-schema/interchange/PhysicalNetlist.capnp" ] \
+   && [ -f "$DEST/libs/interchange/definition/PhysicalNetlist.capnp" ]; then
+  echo "==> linking interchange schema for the wirelength tools"
+  mkdir -p "$DEST/fpga-interchange-schema"
+  ln -sf ../libs/interchange/definition "$DEST/fpga-interchange-schema/interchange"
+fi
+
 echo "==> done: $DEST/build/route"
 echo "    new options:  -g <guide file>   --guide_penalty <float>"
 echo

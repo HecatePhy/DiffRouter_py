@@ -35,7 +35,21 @@ def main():
         sys.exit(f"ERROR: no wirelength_analyzer at {wa_dir}. "
                  f"Run potter/setup_potter.sh or pass --potter.")
     sys.path.insert(0, wa_dir)
-    sys.path.insert(0, os.path.join(potter, "fpga-interchange-schema", "interchange"))
+    # The Cap'n Proto schema (PhysicalNetlist.capnp) ships in Potter under two identical
+    # paths depending on the checkout; use whichever exists so this works on any Potter.
+    schema_dir = next(
+        (d for d in (os.path.join(potter, "fpga-interchange-schema", "interchange"),
+                     os.path.join(potter, "libs", "interchange", "definition"))
+         if os.path.isfile(os.path.join(d, "PhysicalNetlist.capnp"))),
+        None,
+    )
+    if schema_dir is None:
+        sys.exit(
+            "ERROR: PhysicalNetlist.capnp not found under Potter "
+            f"({potter}/fpga-interchange-schema/interchange or "
+            f"{potter}/libs/interchange/definition). Fetch Potter's interchange schema "
+            "(re-run potter/setup_potter.sh), and `pip install pycapnp`.")
+    sys.path.insert(0, schema_dir)
     os.chdir(wa_dir)   # wa.py/capnp resolve schema paths relative to themselves
 
     import capnp  # noqa: F401
