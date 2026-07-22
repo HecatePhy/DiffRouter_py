@@ -23,6 +23,7 @@ def compute_guide_paths(
     eps: float = 1e-6,   # match the CPU Dijkstra extractor's cost scale
     max_rounds: int = 400,
     max_walk: int = 4000,
+    wl_weighted: bool = True,
     verbose: bool = True,
 ) -> Tuple["torch.Tensor", "torch.Tensor"]:
     """Return (net_ids, tile_ids): deduped (net, global tile) pairs, sorted by net."""
@@ -50,7 +51,19 @@ def compute_guide_paths(
     sink_col = conn["sink_flat"].long().to(dev)
     col_net = torch.searchsorted(node_off, src_col, right=True) - 1
 
-    cost = 1.0 / (x.to(dev).clamp_min(0) + eps)
+    # Edge cost: wirelength-weighted, not hop count.
+    #
+    # 1/(x+eps) alone makes every edge cost the same when x is uniform, so the guide is
+    # a min-HOP path -- but the metric is wirelength, and hops are not equal: the RRG
+    # has hops of 1/2/4/12 tiles with contest PIP scores of 1/3/5/10/12/14, so one
+    # 12-tile long line (14) beats twelve 1-hops (12x1=12)... per tile covered. Weighting
+    # by wl_score makes the shortest path a min-WIRELENGTH path, and dividing by x still
+    # pulls it onto the edges the optimiser chose.
+    xd = x.to(dev).clamp_min(0)
+    if wl_weighted and getattr(router, "_flat_wl", None) is not None:
+        cost = router._flat_wl.to(dev, dtype=xd.dtype) / (xd + eps)
+    else:
+        cost = 1.0 / (xd + eps)
 
     t = time.time()
     dist = torch.full((n_nodes,), float("inf"), device=dev)
@@ -128,6 +141,79 @@ def compute_guide_paths(
     return (acc // ntiles), (acc % ntiles)
 
 
+def shortest_path_x(router, dev=None, on_path: float = 1.0, off_path: float = 0.0,
+                    eps: float = 1e-6, verbose: bool = True) -> torch.Tensor:
+    """x initialised to the min-hop routing: on_path on chosen edges, off_path elsewhere.
+
+    Motivation (measured on boom_soc_v2 at the uniform init, x ~ 5e-4):
+      * effective resistance has dR/dw ~ 1/w^2, so its gradient is ~1e8 x every other
+        term -- the AL effectively optimises ER alone;
+      * usage is far below capacity there, so relu(usage-capacity) has *zero* gradient
+        and congestion contributes nothing.
+    Starting from real paths makes conductances O(1) and usage a real net count, so both
+    terms are live from step 1, and x starts sharp rather than diffuse. Whether that
+    actually yields a better solution is an open question -- hence opt-in.
+    """
+    dev = dev or router.device
+    conn = router._conn
+    if conn is None or conn.get("num_cols", 0) == 0:
+        return torch.full((router.num_vars,), off_path, device=dev)
+    fu = conn["flat_u"].long().to(dev)
+    fv = conn["flat_v"].long().to(dev)
+    n_nodes = int(conn["num_nodes"])
+    src_col = conn["src_flat"].long().to(dev)
+    sink_col = conn["sink_flat"].long().to(dev)
+
+    # uniform cost -> min-hop paths (the "control" routing, which measured *better*
+    # discrete congestion than the optimised x)
+    cost = torch.ones(router.num_vars, device=dev)
+
+    t = time.time()
+    dist = torch.full((n_nodes,), float("inf"), device=dev)
+    dist[src_col] = 0.0
+    for _ in range(400):
+        new = dist.clone()
+        new.scatter_reduce_(0, fv, dist[fu] + cost, reduce="amin")
+        new.scatter_reduce_(0, fu, dist[fv] + cost, reduce="amin")
+        if torch.equal(new, dist):
+            break
+        dist = new
+
+    tol = 1e-6
+    big = torch.full((n_nodes,), n_nodes, dtype=torch.long, device=dev)
+    ok_v = (dist[fu] + cost - dist[fv]).abs() <= tol * dist[fv].clamp_min(1.0)
+    ok_u = (dist[fv] + cost - dist[fu]).abs() <= tol * dist[fu].clamp_min(1.0)
+    big.scatter_reduce_(0, fv[ok_v], fu[ok_v], reduce="amin")
+    big.scatter_reduce_(0, fu[ok_u], fv[ok_u], reduce="amin")
+    pred = torch.where(big < n_nodes, big, torch.full_like(big, -1))
+    pred[src_col] = -1
+
+    visited = torch.zeros(n_nodes, dtype=torch.bool, device=dev)
+    visited[sink_col] = True
+    cur = sink_col.clone()
+    alive = torch.ones_like(cur, dtype=torch.bool)
+    for _ in range(4000):
+        nxt = torch.where(alive, pred[cur], torch.full_like(cur, -1))
+        alive = alive & (nxt >= 0)
+        if not bool(alive.any()):
+            break
+        cur = torch.where(alive, nxt, cur)
+        visited[cur[alive]] = True
+
+    # Mark ONLY the traversal-aligned orientation. The walk visits child -> parent, so
+    # source->sink traffic runs pred[v] -> v: the directed variable (fu, fv) with
+    # pred[fv] == fu is the aligned one. Directed pairs both exist in the corridor, and
+    # the old two-clause test marked BOTH orientations -- net flow then cancels exactly
+    # (Ax == 0, flow conservation blind to the init) and every path edge double-counts
+    # against physical capacity.
+    used = (pred[fv] == fu) & visited[fv]
+    x = torch.where(used, torch.full_like(cost, on_path), torch.full_like(cost, off_path))
+    if verbose:
+        print(f"    [init] shortest-path x: {int(used.sum())}/{used.numel()} vars on-path "
+              f"({100*float(used.float().mean()):.2f}%), {time.time()-t:.1f}s", flush=True)
+    return x
+
+
 def write_guide(router, net_ids, tile_ids, out_path: str, verbose: bool = True) -> int:
     """Write the Potter guide file: `<net_name> <ntiles> row,col row,col ...`."""
     import numpy as np
@@ -155,10 +241,12 @@ def write_guide(router, net_ids, tile_ids, out_path: str, verbose: bool = True) 
     return n_written
 
 
-def export_guide(router, x: torch.Tensor, out_path: str, verbose: bool = True) -> int:
+def export_guide(router, x: torch.Tensor, out_path: str, wl_weighted: bool = True,
+                 verbose: bool = True) -> int:
     """Compute + write the guide from an already-loaded router (no reload)."""
     t = time.time()
-    net_ids, tile_ids = compute_guide_paths(router, x, verbose=verbose)
+    net_ids, tile_ids = compute_guide_paths(router, x, wl_weighted=wl_weighted,
+                                           verbose=verbose)
     n = write_guide(router, net_ids, tile_ids, out_path, verbose=verbose)
     if verbose:
         print(f"    [guide] total {time.time()-t:.1f}s", flush=True)

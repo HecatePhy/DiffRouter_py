@@ -9,6 +9,39 @@ from src.router.checkpoint import save_checkpoint
 from src.router.meng_lambda import update_multipliers_meng
 
 
+def _eg_step(x, state, eg_lr, eg_clip, eps=1e-12):
+    """One exponentiated-gradient step with a per-net mass constraint (in place on x).
+
+    x <- x * exp(-eg_lr * ghat), then renormalise each net's total x back to its initial
+    mass. ghat is the raw gradient normalised by its per-net RMS, so eg_lr is a
+    dimensionless step (~0.1-1) that behaves the same regardless of the loss's absolute
+    scale -- important because the terms here span wl~7e4 to ER~1e5. The exponent is
+    clipped to [-eg_clip, eg_clip] so one step moves any edge by at most a factor
+    exp(eg_clip).
+
+    Renormalising to the fixed net mass is what forbids the shrink-to-zero exploit: a
+    hot edge's positive gradient shrinks it, and its net-mates GROW to compensate, so
+    congestion is reduced by moving mass, not deleting it. Off-path edges must start > 0
+    (multiplicative update can't lift an exact zero) -- see the EG setup warning.
+    """
+    var_net = state["var_net"]
+    g = x.grad
+    if g is None:
+        return
+    with torch.no_grad():
+        nnet = state["net_mass0"].numel()
+        gsq = torch.zeros(nnet, device=x.device, dtype=x.dtype)
+        gsq.index_add_(0, var_net, g * g)
+        rms = (gsq / state["count"]).sqrt().clamp_min(eps)
+        ghat = g / rms[var_net]
+        x.mul_(torch.exp((-eg_lr * ghat).clamp_(-eg_clip, eg_clip)))
+        new_sum = torch.zeros(nnet, device=x.device, dtype=x.dtype)
+        new_sum.index_add_(0, var_net, x)
+        x.mul_((state["net_mass0"] / new_sum.clamp_min(eps))[var_net])
+        x.clamp_(0.0, 1.0)
+    x.grad = None
+
+
 def optimize_augmented_lagrangian(
     router,
     x: Optional[torch.Tensor] = None,
@@ -32,6 +65,16 @@ def optimize_augmented_lagrangian(
     disc_ramp_outer: int = 0,
     conn_every: int = 1,
     conn_freeze_outer: int = 0,
+    grad_balance: str = "off",
+    balance_ratio: float = 1.0,
+    balance_every: int = 1,
+    optimizer_kind: str = "adam",
+    eg_lr: float = 0.5,
+    eg_clip: float = 1.0,
+    lam_update: str = "meng",
+    lam_mult_eta: float = 0.5,
+    lam_floor: float = 0.0,
+    lam_base: float = 1.0,
     early_stop_tol: float = 0.0,
     early_stop_patience: int = 3,
     connectivity: str = "effective_resistance",
@@ -65,7 +108,10 @@ def optimize_augmented_lagrangian(
             x = router.init_variables()
         else:
             x = x.detach().clone().requires_grad_(True)
-        lam = torch.zeros(len(router.rrg.phys_list), device=router.device, dtype=x.dtype)
+        # Multiplicative history needs a positive seed (0 * anything = 0 forever).
+        lam_init = lam_base if lam_update == "mult" else 0.0
+        lam = torch.full((len(router.rrg.phys_list),), lam_init,
+                         device=router.device, dtype=x.dtype)
         total_iter = 0
         start_outer = 0
 
@@ -75,9 +121,41 @@ def optimize_augmented_lagrangian(
     if log_setup:
         print(f"  [4b] Created λ multipliers: {len(router.rrg.phys_list)} physical edges")
 
-    optimizer = torch.optim.Adam([x], lr=lr_x)
-    if log_setup:
-        print(f"  [4c] Adam optimizer ready (lr_x={lr_x})")
+    # --- Optimizer setup ---------------------------------------------------------
+    # 'adam' (default): unchanged additive update on the box [0,1]^E. Measured to never
+    # reroute (Jaccard 1.0 support vs init) -- on a box, every congestion loss is
+    # minimised by SHRINKING x, so the optimiser turns paths down instead of moving them.
+    # 'eg': exponentiated-gradient / mirror descent with a PER-NET mass constraint. Each
+    # net's total x is pinned to its initial value, so congestion can only be reduced by
+    # MOVING mass off hot edges onto connected alternatives (the flow-conservation +
+    # wirelength terms decide where it lands) -- the feasible set becomes a simplex per
+    # net instead of a box, which is the structural change that makes rerouting possible.
+    optimizer = None
+    eg_state = None
+    if optimizer_kind == "adam":
+        optimizer = torch.optim.Adam([x], lr=lr_x)
+        if log_setup:
+            print(f"  [4c] Adam optimizer ready (lr_x={lr_x})")
+    elif optimizer_kind == "eg":
+        vo = torch.tensor(router._var_offset, dtype=torch.long, device=router.device)
+        counts = (vo[1:] - vo[:-1]).clamp_min(1)
+        var_net = torch.repeat_interleave(
+            torch.arange(len(counts), device=router.device), counts)
+        with torch.no_grad():
+            net_mass0 = torch.zeros(len(counts), device=router.device, dtype=x.dtype)
+            net_mass0.index_add_(0, var_net, x.detach())
+            xmin = float(x.min())
+        eg_state = {"var_net": var_net, "net_mass0": net_mass0,
+                    "count": counts.to(x.dtype)}
+        if log_setup:
+            print(f"  [4c] EG optimizer ready (eg_lr={eg_lr}, clip={eg_clip}); "
+                  f"per-net mass pinned to init")
+        if xmin <= 0.0:
+            print("  [4c] WARNING: init x has exact zeros -- EG is multiplicative, so "
+                  "those stay 0 forever. Use --init-mode shortest_path --init-off-path "
+                  "0.01 (or any >0) so off-path edges can receive mass.", flush=True)
+    else:
+        raise ValueError(f"unknown optimizer_kind={optimizer_kind!r}")
 
     gif_frames = []
     if viz_dir:
@@ -94,8 +172,32 @@ def optimize_augmented_lagrangian(
                 f"(after rho reaches {rho_max})"
             )
 
+    if log_setup and grad_balance != "off":
+        print(f"  [4e] Gradient balancing: {grad_balance}, ratio={balance_ratio}, "
+              f"every {balance_every} outer(s)")
+
     ovf_hist: list = []
+    w_conn_bal = w_conn
     for outer in range(start_outer, num_outer):
+        # Gradient balancing (opt-in). Measured on boom_soc_v2: ||grad|| is 7.2e4 for
+        # wirelength, 2.7e7 for the congestion penalty at rho_max -- but 1.3e13 to 3.2e14
+        # for effective resistance, because dR/dw ~ 1/w^2 blows up at small x. So ER is
+        # ~1e10x every other term and the AL optimises it alone. lambda cannot correct
+        # this: the Meng update is normalised, so ||dlam|| == lr_lam per outer regardless
+        # of violation, and multipliers weight the *constraint* anyway -- there is no
+        # multiplier on an objective term. Rescaling w_conn so ||w_conn*grad_conn|| ==
+        # balance_ratio * ||grad_wl|| puts every term within ~1e2 of the others, which is
+        # the commensurate regime lambda/rho were designed for.
+        if grad_balance == "conn" and outer % balance_every == 0:
+            norms = router.term_grad_norms(x, connectivity_solver=connectivity_solver)
+            g_wl = norms["wirelength"][1]
+            g_cn = norms["connectivity"][1]
+            if g_cn > 0:
+                w_conn_bal = balance_ratio * g_wl / g_cn
+                if verbose:
+                    print(f"      [balance] ||g_wl||={g_wl:.3e} ||g_conn||={g_cn:.3e} "
+                          f"-> w_conn={w_conn_bal:.3e}", flush=True)
+
         # Anneal discretization weight from 0 to w_disc over disc_ramp_outer outers
         # (establish connectivity first, then sharpen to discrete paths).
         if w_disc != 0.0 and disc_ramp_outer > 0:
@@ -105,11 +207,14 @@ def optimize_augmented_lagrangian(
         # A2: freeze connectivity after it has converged (conn_freeze_outer>0).
         conn_frozen = conn_freeze_outer > 0 and outer >= conn_freeze_outer
         for _inner in range(num_inner):
-            optimizer.zero_grad()
+            if optimizer is not None:
+                optimizer.zero_grad()
+            else:
+                x.grad = None
             # A1: evaluate the (expensive) connectivity term only every conn_every
             # inner steps; other steps optimize wirelength/congestion/flow only.
             include_conn = (not conn_frozen) and (total_iter % conn_every == 0)
-            w_conn_step = w_conn if include_conn else 0.0
+            w_conn_step = w_conn_bal if include_conn else 0.0
             L_A = router.augmented_lagrangian(
                 x,
                 lam,
@@ -124,9 +229,12 @@ def optimize_augmented_lagrangian(
                 flow_net_batch=flow_net_batch,
             )
             L_A.backward()
-            optimizer.step()
-            with torch.no_grad():
-                x.clamp_(0.0, 1.0)
+            if optimizer is not None:
+                optimizer.step()
+                with torch.no_grad():
+                    x.clamp_(0.0, 1.0)
+            else:
+                _eg_step(x, eg_state, eg_lr, eg_clip)
 
             total_iter += 1
 
@@ -159,7 +267,18 @@ def optimize_augmented_lagrangian(
             _, overflows = router._get_usage_and_overflows(x)
             if overflow_ref is None:
                 overflow_ref = torch.clamp(overflows.clone(), min=1e-8)
-            lam = update_multipliers_meng(lam, overflows, overflow_ref, lr_lam)
+            if lam_update == "mult":
+                # Multiplicative (PathFinder-style) history: lam grows geometrically on
+                # edges that stay over capacity, so a persistently-contested edge keeps
+                # getting more expensive even after brief relief -- the ratchet the
+                # normalised Meng update lacks (measured lam_max=0.0104, decorative).
+                # lam <- lam * (1 + eta * relu(u/c - 1)), floored so it never dies.
+                u = router._phys_usage(x)
+                c = router._phys_capacity_tensor.clamp_min(1e-12)
+                lam = torch.clamp(lam * (1.0 + lam_mult_eta * torch.relu(u / c - 1.0)),
+                                  min=lam_floor)
+            else:
+                lam = update_multipliers_meng(lam, overflows, overflow_ref, lr_lam)
 
         if overflows.max().item() > 0.1 and rho < rho_max:
             rho = min(rho * rho_mult, rho_max)
