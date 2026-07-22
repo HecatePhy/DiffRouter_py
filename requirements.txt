@@ -1,10 +1,14 @@
-# DiffRouter Python dependencies.
-# Reproduced with: Python 3.9, CUDA 12.x. Install: pip install -r requirements.txt
+# DiffRouter Python dependencies.  Python 3.9, CUDA 12.x (reference: torch 2.8.0+cu128).
 #
-# Core — global routing + guide export (run_exp.py, scripts/crossing_metric.py,
-# scripts/total_wirelength.py). torch must match your CUDA toolkit; the pinned build
-# below was torch 2.8.0+cu128. For a different CUDA version install the matching torch
-# wheel from https://pytorch.org first, then the rest.
+# !!! INSTALL TORCH FIRST, WITH CUDA !!!
+# `pip install -r requirements.txt` alone pulls the CPU-only torch wheel from PyPI, so
+# torch.cuda.is_available() is False and the global route silently runs on CPU (very
+# slow, nvidia-smi shows nothing). Install the CUDA build that matches your driver BEFORE
+# the rest -- find the driver's CUDA version in `nvidia-smi` (top-right) and pick cuXXX
+# at or below it:
+#     pip install torch --index-url https://download.pytorch.org/whl/cu121   # cu118/cu121/cu124...
+# Verify: python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+# The torch line below is only a version floor; it does NOT guarantee a CUDA build.
 torch>=2.0
 numpy>=1.24
 
