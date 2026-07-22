@@ -28,17 +28,20 @@ boost-serialization (Cap'n Proto is bundled with Potter). The patch itself is
 `--guide_penalty` options, a soft out-of-guide term in the A* node cost, and net-name
 capture so guides can be matched to nets.
 
-### The two modes
+### The three modes
 
 | mode | global route | Potter penalty | optimizes for |
 |------|-------------|----------------|---------------|
 | **(1) cpwl-driven** | max-connectivity (`--conn-every 5`) | 2 (strong) | critical-path wirelength |
 | **(2) runtime-driven** | fastest (`+ --conn-super-sink --conn-multi-gpu`) | 0.5 (gentle) | end-to-end runtime |
+| **(3) totwl-driven** | EG optimizer (`--optimizer-kind eg`, shortest-path init) | 0.5 (gentle) | total wirelength |
 
-Both modes use the same **tight per-net shortest-path guide** (written inline by
-`--guide-out`); they differ in the global-route config and `--guide_penalty`. Guide
-*tightness* is what delivers the benefit — a loose guide is equivalent to no guide (see
-[Guide export](#guide-export-for-potter)).
+Modes (1) and (2) use the Adam optimizer and differ only in the global-route config and
+`--guide_penalty`. Mode (3) uses the **exponentiated-gradient (EG) optimizer**: mirror
+descent that updates each net's edge variables under a per-net mass constraint (a simplex),
+started from a shortest-path initialization. All three write a **tight per-net guide**
+inline via `--guide-out`; guide *tightness* delivers the benefit — a loose guide is
+equivalent to no guide (see [Guide export](#guide-export-for-potter)).
 
 ### (1) cpwl-driven — best wirelength
 
@@ -76,6 +79,35 @@ third_party/Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
     -o routed.phys -d data/xcvu3p.device -t 32 -r \
     -g bsv2.guide --guide_penalty 0.5
 ```
+
+### (3) totwl-driven — EG optimizer
+
+Shortest-path init → EG (mirror-descent) global route → tight guide → gentle penalty. EG
+updates each net's edge variables under a per-net mass constraint (see the
+[EG optimizer options](#eg-optimizer---optimizer-kind-eg)), so a net's flow is
+redistributed across its corridor rather than rescaled in place.
+
+```bash
+# 1. global route + guide: EG optimizer from a shortest-path init
+python run_exp.py --testcase boom_soc_v2 --global-only \
+    --connectivity-solver grouped --conn-warm-start \
+    --conn-col-chunk 128 --conn-cg-max-iter 8 --conn-every 5 \
+    --max-iterations 40 --num-inner 5 --skip-extract \
+    --init-mode shortest_path --init-off-path 0.01 \
+    --optimizer-kind eg --eg-lr 0.5 --eg-clip 1.0 \
+    --congestion-mode soft --congestion-tau 0.1 \
+    --lam-update mult --lam-mult-eta 0.5 --lam-base 1.0 \
+    --conn-sat-alpha 1.5 \
+    --guide-out bsv2.guide
+
+# 2. Potter, gentle guide
+third_party/Potter/build/route -i data/boom_soc_v2/boom_soc_v2_unrouted.phys \
+    -o routed.phys -d data/xcvu3p.device -t 32 -r \
+    -g bsv2.guide --guide_penalty 0.5
+```
+
+All-benchmark sweep: `scripts/run_eg_sweep.sh` runs this mode over every benchmark that
+has a net index and reports {CPWL, total WL} vs the ctrl/opt5 guides.
 
 `--guide-out` writes the guide **inline**, reusing the router already in memory — no
 save/reload round-trip. `--skip-extract` skips the tile-path extraction, which the guide
@@ -232,6 +264,27 @@ for the fastest, least-congested route.
 | `--w-flow` | 1.0 | Flow conservation (directed mode only) |
 | `--w-disc` | 0.0 | Discretization `Σx(1-x)`. Found ineffective — the congestion penalty pins `x` below 0.5, so this only shrinks weights (see `--disc-ramp-outer`) |
 | `--rho`, `--lr-x`, `--lr-lam` | 1.0 / 0.01 / 0.1 | AL penalty + step sizes |
+
+### EG optimizer (`--optimizer-kind eg`)
+
+Mode (3). Mirror-descent update that multiplies each edge variable by
+`exp(-eg_lr · ĝ)` and renormalizes each net's total `x` back to its initial value, so the
+optimization moves over a per-net simplex. All flags below default to the Adam behavior;
+`--optimizer-kind eg` is opt-in and unchanged runs are byte-identical to before.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--optimizer-kind` | `adam` | `adam` (additive, on the box) or `eg` (mirror descent, per-net simplex) |
+| `--eg-lr` | 0.5 | EG step size (dimensionless; gradient is per-net RMS-normalized) |
+| `--eg-clip` | 1.0 | Per-step exponent clip: an edge moves by at most a factor `exp(eg_clip)` |
+| `--init-mode` | `uniform` | `shortest_path` starts `x` from the min-hop routing; **required for EG** (multiplicative update cannot lift an exact zero, so off-path edges need `x>0`) |
+| `--init-off-path F` | 0.0 | `--init-mode shortest_path`: `x` on off-path corridor edges (use `0.01` for EG) |
+| `--congestion-mode` | `hard` | `hard` = `relu(usage-cap)`; `soft` = capacity-relative softplus (gradient below capacity, `→ hard` as `--congestion-tau → 0`) |
+| `--congestion-tau` | 0.1 | Softness (fraction of capacity) for `--congestion-mode soft` |
+| `--lam-update` | `meng` | `meng` = normalized subgradient; `mult` = PathFinder-style history `λ ← λ(1+η·relu(u/c-1))` |
+| `--lam-mult-eta`, `--lam-base` | 0.5 / 1.0 | `--lam-update mult`: growth rate per outer, and initial `λ` |
+| `--conn-sat-alpha A` | 0.0 | Saturating connectivity `Σ relu(R_eff - A·d_min)` (`d_min` = min-hop distance); `0` = plain `Σ R_eff` |
+| `--flow-demand` | `fanout` | `fanout` = `{src:-K, sink:+1}`; `normalized` = `{src:-1, sink:+1/K}` |
 
 ### Guide export (for Potter)
 
